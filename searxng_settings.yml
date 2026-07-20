@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# HYPERION — SearxNG Settings
+# Self-hosted meta-search. Docker-based. Aggregates 70+ search engines.
+# No API key, no rate limit, no tracking. Used by all specialist agents.
+# ═══════════════════════════════════════════════════════════════════════════
+
+use_default_settings: true
+
+general:
+  instance_name: "HYPERION Search"
+  debug: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "hyperion-searxng-secret-change-me"
+  bind_address: "0.0.0.0"
+  port: 8888
+  limiter: false
+  image_proxy: true
+
+ui:
+  static_use_hash: true
+  default_locale: "en"
+  default_theme: "simple"
+  themes:
+    - simple
+
+outgoing:
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  useragent_suffix: "HYPERION"
+  # No proxy needed — direct connection for research scraping
+  proxies: null
+
+engines:
+  # Prioritize engines that return structured, citable results
+  # for consulting-grade research
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+
+  # Disable social media engines — not useful for consulting research
+  - name: twitter
+    engine: twitter
+    disabled: true
+
+  - name: instagram
+    engine: instagram
+    disabled: true

@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Reports (generated PDFs — gitignored per §9)
+reports/*
+!reports/.gitkeep
+
+# Assets (cached images, downloaded fonts — gitignored per §9)
+assets/images/*
+!assets/images/.gitkeep
+assets/fonts/*
+!assets/fonts/.gitkeep
+!assets/fonts/README.md
+
+# Vault content (accumulates over time — keep structure, ignore content)
+vault/engagements/*
+!vault/engagements/.gitkeep
+vault/markets/*
+!vault/markets/.gitkeep
+vault/competitors/*
+!vault/competitors/.gitkeep
+
+# Keep vault frameworks and sources (seed content is version-controlled)
+# vault/frameworks/ — tracked
+# vault/sources/ — tracked
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+logs/

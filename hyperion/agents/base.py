@@ -1,0 +1,580 @@
+"""
+HYPERION BaseAgent — the foundation class for all 20 agents.
+
+This is NOT a generic agent base class. It is the contract that every
+HYPERION agent — from the Engagement Director to the Render Engine —
+must fulfill. Every agent has:
+
+- Identity: AgentName + AgentRole (who they are)
+- Intelligence: ModelTier (what level they operate at)
+- Tools: ToolName list (what they can actually use — not decorative)
+- Skills: SkillSpec list (proprietary analytical frameworks)
+- System prompt: their expertise, voice, methodology (not generic)
+- AgentBus subscription: for inter-agent communication (§4.8)
+- Runtime state: AgentRuntimeState for TUI display (§8.5)
+- Structured output: produces Pydantic models, not free text (§0.1)
+
+The BaseAgent provides:
+1. Bus integration — publish findings, status, escalations, handoffs
+2. Router integration — request LLM completions by tier (agents don't know providers)
+3. Tool access — lazy-initialized tool instances, only available if in spec
+4. Sub-agent spawning — delegates to SubAgentRunner with 5-min timeout
+5. State management — transitions published to bus for TUI display
+6. Error handling — BLOCKED state on failure, escalation to Director
+
+Agents override `run()` with their proprietary methodology.
+The `run()` method is where the agent's skills are applied.
+(§4.1, §0.1)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from abc import ABC, abstractmethod
+from typing import Any, TypeVar
+
+from pydantic import BaseModel
+
+from hyperion.agents.bus import AgentBus, Channel, get_bus
+from hyperion.config import ModelTier, get_settings
+from hyperion.router.budget import TaskUrgency
+from hyperion.router.providers.base import RouterResponse
+from hyperion.router.router import LLMRouter, get_router
+from hyperion.schemas.agents import (
+    AgentName,
+    AgentRole,
+    AgentRuntimeState,
+    AgentSpec,
+    AgentState,
+    SkillSpec,
+    SubAgentSpec,
+    ToolName,
+)
+from hyperion.schemas.models import KeyFinding
+
+# Type variable for structured output models
+T = TypeVar("T", bound=BaseModel)
+
+
+class BaseAgent(ABC):
+    """The foundation class for all HYPERION agents.
+
+    Every agent in HYPERION extends this class. The base provides:
+    - Bus integration (publish/subscribe per §4.8)
+    - Router integration (tier-based LLM calls per §3.1)
+    - Tool access (only tools in the agent's spec)
+    - Sub-agent spawning (with 5-min timeout per §4.7)
+    - State management (published to bus for TUI per §8.5)
+    - Structured output (Pydantic models, not free text per §0.1)
+
+    Agents override `run()` with their proprietary methodology.
+    The system prompt is loaded from the AgentSpec — it is the agent's
+    expertise, voice, and methodology, not a generic instruction.
+
+    This class is NOT instantiable directly — it is abstract.
+    Each of the 20 agents has its own class with a specific spec
+    and a run() method that applies that agent's proprietary skills.
+    """
+
+    def __init__(
+        self,
+        spec: AgentSpec,
+        bus: AgentBus | None = None,
+        router: LLMRouter | None = None,
+    ) -> None:
+        self.spec = spec
+        self.bus = bus or get_bus()
+        self.router = router or get_router()
+        self.settings = get_settings()
+
+        # Runtime state — published to bus for TUI agent grid (§8.5)
+        self.state = AgentRuntimeState(
+            agent_name=spec.name,
+            state=AgentState.IDLE,
+            model_tier=spec.model_tier,
+            last_state_change=time.time(),
+        )
+
+        # Tool instances — lazy initialized, only for tools in spec
+        self._tools: dict[ToolName, Any] = {}
+
+        # Findings collected by this agent
+        self._findings: list[KeyFinding] = []
+
+        # Sub-agent specs spawned by this agent
+        self._sub_agent_specs: list[SubAgentSpec] = []
+
+        # Subscription ID for bus
+        self._sub_id = f"agent_{spec.name.value}"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Identity
+    # ─────────────────────────────────────────────────────────────────────
+
+    @property
+    def name(self) -> AgentName:
+        return self.spec.name
+
+    @property
+    def role(self) -> AgentRole:
+        return self.spec.role
+
+    @property
+    def display_name(self) -> str:
+        return self.spec.display_name
+
+    @property
+    def model_tier(self) -> ModelTier:
+        return self.spec.model_tier
+
+    @property
+    def skills(self) -> list[SkillSpec]:
+        return self.spec.skills
+
+    @property
+    def tools(self) -> list[ToolName]:
+        return self.spec.tools
+
+    @property
+    def max_sub_agents(self) -> int:
+        return self.spec.max_sub_agents
+
+    @property
+    def system_prompt(self) -> str:
+        return self.spec.system_prompt
+
+    # ─────────────────────────────────────────────────────────────────────
+    # State Management — published to bus for TUI (§8.5)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _transition(self, new_state: AgentState, detail: str = "") -> None:
+        """Transition to a new state and publish to bus.
+
+        The TUI agent grid (§8.5) updates within 100ms of this publish.
+        States: IDLE → WORKING → WAITING → DONE / BLOCKED
+        """
+        self.state.transition_to(new_state, detail)
+        await self.bus.publish_status(
+            agent=self.name,
+            state=new_state,
+            detail=detail,
+            tools=[t.value for t in self.state.active_tools],
+            findings_count=self.state.findings_count,
+            sub_agents=self.state.sub_agents_active,
+        )
+
+    async def _set_active_tools(self, tools: list[ToolName]) -> None:
+        """Update which tools are currently active — for TUI display."""
+        self.state.active_tools = tools
+        await self.bus.publish_status(
+            agent=self.name,
+            state=self.state.state,
+            detail=self.state.detail,
+            tools=[t.value for t in tools],
+            findings_count=self.state.findings_count,
+            sub_agents=self.state.sub_agents_active,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Bus Integration (§4.8)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def subscribe_to_bus(self) -> None:
+        """Subscribe to appropriate bus channels based on agent role.
+
+        Subscription patterns (§4.8):
+        - Core (Engagement Director): ALL channels (omniscient)
+        - Specialists: findings + requests (need-aware)
+        - Support: findings (Fact Checker needs all findings)
+        - Delivery: findings (need final report content)
+        """
+        if self.role == AgentRole.CORE:
+            channels = {Channel.STATUS, Channel.FINDINGS, Channel.REQUESTS,
+                       Channel.ESCALATION, Channel.HANDOFF, Channel.TUI}
+        elif self.role == AgentRole.SPECIALIST:
+            channels = {Channel.FINDINGS, Channel.REQUESTS}
+        elif self.role == AgentRole.SUPPORT:
+            channels = {Channel.FINDINGS}
+        elif self.role == AgentRole.DELIVERY:
+            channels = {Channel.FINDINGS}
+        else:
+            channels = {Channel.FINDINGS}
+
+        self.bus.subscribe(
+            subscriber_id=self._sub_id,
+            agent=self.name,
+            channels=channels,
+            callback=self._handle_bus_message,
+        )
+
+    async def _handle_bus_message(self, msg: Any) -> None:
+        """Handle incoming bus messages.
+
+        Override in subclasses for agent-specific message handling.
+        Default: ignore (agent processes messages in its run() loop).
+        """
+        pass
+
+    async def _publish_finding(self, finding: KeyFinding) -> None:
+        """Publish a completed finding to the bus.
+
+        Other agents consume findings via their subscriptions.
+        The Fact Checker verifies all findings.
+        The Synthesis Lead collects all findings for reconciliation.
+        The TUI displays findings in the findings stream (§8.7).
+        """
+        self._findings.append(finding)
+        self.state.findings_count = len(self._findings)
+        await self.bus.publish_finding(self.name, finding)
+
+    async def _publish_findings(self, findings: list[KeyFinding]) -> None:
+        """Publish multiple findings."""
+        for finding in findings:
+            await self._publish_finding(finding)
+
+    async def _escalate(self, issue: str, suggested_action: str = "") -> None:
+        """Escalate an issue to the Engagement Director.
+
+        The Director receives escalations and can:
+        - Spawn new agents mid-engagement (adaptive replanning, §10.2)
+        - Reroute tasks if an agent fails
+        - Reallocate model tiers if budget is running low
+        """
+        await self.bus.publish_escalation(
+            agent=self.name,
+            issue=issue,
+            suggested_action=suggested_action,
+        )
+        await self._transition(AgentState.BLOCKED, f"Escalated: {issue}")
+
+    async def _request_from_agent(
+        self,
+        to_agent: AgentName,
+        request_type: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        """Request data or context from another agent.
+
+        Example: Financial Analyst requests Market Analyst's TAM number
+        before building the DCF model. (§4.8)
+        """
+        await self.bus.publish_request(
+            from_agent=self.name,
+            to_agent=to_agent,
+            request_type=request_type,
+            context=context,
+        )
+
+    async def _handoff_to_agent(
+        self,
+        to_agent: AgentName,
+        task: str,
+        context_bundle: dict[str, Any] | None = None,
+    ) -> None:
+        """Hand off a task to another agent.
+
+        Example: Engagement Director hands off a sub-task to a specialist.
+        (§4.8)
+        """
+        await self.bus.publish_handoff(
+            from_agent=self.name,
+            to_agent=to_agent,
+            task=task,
+            context_bundle=context_bundle,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Router Integration (§3.1) — agents don't know providers
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _llm_complete(
+        self,
+        user_prompt: str,
+        system_prompt_override: str | None = None,
+        urgency: TaskUrgency = TaskUrgency.NORMAL,
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        response_format: dict[str, str] | None = None,
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> RouterResponse:
+        """Request an LLM completion at this agent's model tier.
+
+        Agents don't know which provider they're using — they request a
+        tier and the router decides. This is the core abstraction that
+        decouples agent intelligence from infrastructure. (§9)
+
+        The agent's system prompt is always prepended. If
+        system_prompt_override is provided, it replaces the default.
+        """
+        system = system_prompt_override or self.system_prompt
+
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        if conversation_history:
+            messages.extend(conversation_history)
+        messages.append({"role": "user", "content": user_prompt})
+
+        await self._transition(
+            AgentState.WAITING,
+            f"Requesting {self.model_tier.value} tier completion",
+        )
+
+        response = await self.router.complete(
+            tier=self.model_tier,
+            messages=messages,
+            agent_name=self.name.value,
+            urgency=urgency,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+
+        if not response.success:
+            await self._transition(
+                AgentState.BLOCKED,
+                f"LLM completion failed: {response.error}",
+            )
+            # Escalate so the Director can reroute
+            await self._escalate(
+                issue=f"LLM completion failed at {self.model_tier.value} tier: {response.error}",
+                suggested_action="Reroute to adjacent tier or retry with different provider",
+            )
+
+        return response
+
+    async def _llm_complete_structured(
+        self,
+        user_prompt: str,
+        output_model: type[T],
+        system_prompt_override: str | None = None,
+        urgency: TaskUrgency = TaskUrgency.NORMAL,
+        temperature: float = 0.3,
+        conversation_history: list[dict[str, str]] | None = None,
+    ) -> T | None:
+        """Request a structured LLM completion that returns a Pydantic model.
+
+        Every agent produces structured output, not free text (§0.1).
+        This method uses the router's response and parses it into the
+        specified Pydantic model. If parsing fails, returns None and
+        escalates.
+
+        The temperature is lower (0.3) for structured output to reduce
+        randomness — we want deterministic, typed results.
+        """
+        import json
+
+        response = await self._llm_complete(
+            user_prompt=user_prompt,
+            system_prompt_override=system_prompt_override,
+            urgency=urgency,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+            conversation_history=conversation_history,
+        )
+
+        if not response.success or not response.content:
+            return None
+
+        try:
+            data = json.loads(response.content)
+            return output_model.model_validate(data)
+        except (json.JSONDecodeError, ValueError) as e:
+            await self._escalate(
+                issue=f"Structured output parsing failed: {e}",
+                suggested_action="Retry with explicit JSON instruction in prompt",
+            )
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Tool Access (§5.1) — only tools in the agent's spec
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_tool(self, tool: ToolName) -> Any:
+        """Get a tool instance, but only if it's in this agent's spec.
+
+        No decorative tools. No agent has a tool it doesn't use.
+        If the tool is not in the agent's spec, raises ValueError.
+        (§5.1, §12.3)
+        """
+        if not self.spec.has_tool(tool):
+            raise ValueError(
+                f"Agent {self.name.value} does not have access to tool {tool.value}. "
+                f"Tools available: {[t.value for t in self.spec.tools]}"
+            )
+
+        if tool not in self._tools:
+            self._tools[tool] = self._instantiate_tool(tool)
+
+        return self._tools[tool]
+
+    def _instantiate_tool(self, tool: ToolName) -> Any:
+        """Instantiate a tool by name.
+
+        Tools are imported lazily to avoid circular imports and to keep
+        startup fast. Each tool is a singleton within the agent.
+        """
+        # Tool imports are deferred to avoid circular dependencies
+        # The tools/ layer will be built next, but the agent layer
+        # must be structured to accept them.
+        if tool == ToolName.SEARXNG:
+            from hyperion.tools.searxng import SearxNGClient
+            return SearxNGClient(settings=self.settings)
+        elif tool == ToolName.JINA:
+            from hyperion.tools.jina import JinaClient
+            return JinaClient(settings=self.settings)
+        elif tool == ToolName.OBSCURA:
+            from hyperion.tools.obscura import ObscuraClient
+            return ObscuraClient(settings=self.settings)
+        elif tool == ToolName.CRAWL4AI:
+            from hyperion.tools.crawl4ai import Crawl4AIClient
+            return Crawl4AIClient(settings=self.settings)
+        elif tool == ToolName.WAYBACK:
+            from hyperion.tools.wayback import WaybackClient
+            return WaybackClient(settings=self.settings)
+        elif tool == ToolName.ALPHA_VANTAGE:
+            from hyperion.tools.alpha_vantage import AlphaVantageClient
+            return AlphaVantageClient(settings=self.settings)
+        elif tool == ToolName.FRED:
+            from hyperion.tools.fred import FredClient
+            return FredClient(settings=self.settings)
+        elif tool == ToolName.UNSPLASH:
+            from hyperion.tools.unsplash import UnsplashClient
+            return UnsplashClient(settings=self.settings)
+        elif tool == ToolName.SECOND_BRAIN:
+            from hyperion.tools.second_brain import SecondBrainClient
+            return SecondBrainClient(settings=self.settings)
+        elif tool == ToolName.PLOTLY:
+            from hyperion.output.charts import ChartGenerator
+            return ChartGenerator(settings=self.settings)
+        elif tool == ToolName.WEASYPRINT:
+            from hyperion.output.render import PDFRenderer
+            return PDFRenderer(settings=self.settings)
+        elif tool == ToolName.JINJA2:
+            from hyperion.output.render import TemplateRenderer
+            return TemplateRenderer(settings=self.settings)
+        elif tool == ToolName.PILLOW:
+            from hyperion.output.images import ImageProcessor
+            return ImageProcessor(settings=self.settings)
+        else:
+            raise ValueError(f"Unknown tool: {tool}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Sub-Agent Spawning (§4.7)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _spawn_sub_agent(self, spec: SubAgentSpec) -> list[KeyFinding]:
+        """Spawn a junior sub-agent for a focused sub-question.
+
+        Sub-agents handle context isolation (§4.7):
+        - Max 3 per specialist per engagement
+        - MICRO or FAST tier only (don't burn STRONG/DEEP quota)
+        - 5-minute timeout
+        - Returns structured KeyFinding objects, not free text
+        - Cannot spawn their own sub-agents (no recursive spawning)
+
+        The parent specialist receives the sub-agent's findings and
+        synthesizes them into its own analysis. The parent's context
+        window is used for synthesis, not for raw research.
+        """
+        from hyperion.agents.sub_agent import SubAgentRunner
+
+        if len(self._sub_agent_specs) >= self.max_sub_agents:
+            await self._escalate(
+                issue=f"Max sub-agents ({self.max_sub_agents}) already spawned",
+                suggested_action="Proceed with available findings and flag the gap",
+            )
+            return []
+
+        # Validate tier — sub-agents must use MICRO or FAST (§4.7)
+        if spec.model_tier not in (ModelTier.MICRO, ModelTier.FAST):
+            raise ValueError(
+                f"Sub-agent tier must be MICRO or FAST, got {spec.model_tier.value}"
+            )
+
+        self._sub_agent_specs.append(spec)
+        self.state.sub_agents_spawned += 1
+        self.state.sub_agents_active += 1
+
+        await self._transition(
+            AgentState.SUB_AGENT_SPAWNED,
+            f"Spawned sub-agent: {spec.question[:80]}",
+        )
+
+        runner = SubAgentRunner(spec=spec, bus=self.bus, router=self.router)
+
+        try:
+            findings = await asyncio.wait_for(
+                runner.run(),
+                timeout=spec.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            # §4.7: "if a sub-agent doesn't return in 5 min, the parent
+            # proceeds with available findings and flags the gap"
+            findings = []
+            await self._escalate(
+                issue=f"Sub-agent timed out: {spec.question[:80]}",
+                suggested_action="Proceed with available findings and flag the gap",
+            )
+
+        self.state.sub_agents_active -= 1
+        await self._transition(
+            AgentState.WORKING,
+            f"Sub-agent returned {len(findings)} findings",
+        )
+
+        return findings
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Lifecycle
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def initialize(self) -> None:
+        """Initialize the agent — subscribe to bus, set state to IDLE."""
+        self.subscribe_to_bus()
+        await self._transition(AgentState.IDLE, "Initialized")
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:
+        """Execute the agent's run() method with proper lifecycle management.
+
+        This wraps run() with:
+        1. State transition to WORKING
+        2. Error handling — BLOCKED on failure
+        3. State transition to DONE on success
+        4. Bus status updates throughout
+
+        Agents should NOT override this method — override run() instead.
+        """
+        await self._transition(AgentState.WORKING, "Starting execution")
+
+        try:
+            result = await self.run(*args, **kwargs)
+            await self._transition(AgentState.DONE, "Execution complete")
+            return result
+        except Exception as e:
+            await self._transition(
+                AgentState.BLOCKED,
+                f"Execution failed: {e}",
+            )
+            await self._escalate(
+                issue=f"Agent execution failed: {e}",
+                suggested_action="Reroute task or retry with different approach",
+            )
+            raise
+
+    @abstractmethod
+    async def run(self, *args: Any, **kwargs: Any) -> Any:
+        """The agent's proprietary methodology.
+
+        Every agent overrides this with its specific analytical framework.
+        This is where the agent's skills are applied, tools are wielded,
+        and structured output is produced.
+
+        NOT a generic "research and write" method. Each agent's run()
+        applies specific frameworks in a specific order with specific
+        tools to produce specific structured output. (§0.1, §4.1)
+        """
+        ...
+
+    async def cleanup(self) -> None:
+        """Cleanup after execution — unsubscribe from bus."""
+        self.bus.unsubscribe(self._sub_id)

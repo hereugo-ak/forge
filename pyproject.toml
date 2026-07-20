@@ -1,0 +1,79 @@
+[project]
+name = "hyperion"
+version = "0.1.0"
+description = "HYPERION — Deep Research Intelligence System for AI Consulting. Not a wrapper. A proprietary consulting model."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "HYPERION Consulting" }]
+
+dependencies = [
+    # LLM + structured output — all 4 providers expose OpenAI-compatible APIs
+    "instructor>=1.4.0",
+    "openai>=1.40.0",
+    "httpx>=0.27.0",
+    "tenacity>=8.5.0",
+
+    # Data models + config
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "python-dotenv>=1.0.0",
+
+    # Search + extraction
+    "duckduckgo-search>=6.0.0",
+    "crawl4ai>=0.4.0",
+    "transformers>=4.44.0",
+    "websockets>=12.0",
+
+    # Report generation — 300 DPI PDFs, Plotly charts, Pillow image pipeline
+    "weasyprint>=62.0",
+    "jinja2>=3.1.0",
+    "plotly>=5.22.0",
+    "kaleido>=0.2.1",
+    "pillow>=10.4.0",
+
+    # TUI — Textual + Rich + Typer
+    "textual>=0.70.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+
+    # Data sources
+    "alpha-vantage>=3.0.0",
+    "fredpy>=1.0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+hyperion = "hyperion.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hyperion"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "TCH"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true

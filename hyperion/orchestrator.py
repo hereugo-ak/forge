@@ -1,0 +1,836 @@
+"""
+HYPERION Orchestrator — the WorkflowEngine that ties everything together.
+
+This is NOT a generic "run the agents" wrapper. It is the execution engine
+that implements the 5-stage dynamic workflow pipeline from ARCHITECTURE.md §4.9:
+
+  Stage 1: Engagement Director decomposes question → WorkflowDAG
+  Stage 2: Specialists execute in parallel (asyncio.gather) with dependencies
+  Stage 3: Fact Checker verifies all findings (parallel with Synthesis)
+  Stage 4: Synthesis Lead reconciles → FinalReport → Quality Gate scores
+  Stage 5: Presentation Designer → Data Visualizer → Render Engine → PDF
+
+The orchestrator:
+- Instantiates agents lazily (only when their task is ready to run)
+- Executes tasks in topological order (dependencies first)
+- Runs independent tasks in parallel via asyncio.gather
+- Monitors the AgentBus for escalations and adapts the DAG
+- Tracks budget consumption across the entire engagement
+- Produces an EngagementResult with the final PDF path and metadata
+- Saves engagement context to Second Brain for future learning (§12.8)
+
+The orchestrator is the glue between the Engagement Director's plan and
+the actual execution. The Director plans; the orchestrator executes.
+
+Architecture reference: §4.9 Dynamic Workflow Engine, §10.2 Adaptive Replanning
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+
+from hyperion.agents.bus import Channel, get_bus, reset_bus
+from hyperion.agents.engagement_director import EngagementDirector
+from hyperion.agents.synthesis_lead import SynthesisLead
+from hyperion.schemas.agents import AgentName, AgentState
+from hyperion.schemas.models import (
+    FactCheckReport,
+    FinalReport,
+    LayoutPlan,
+    QualityScore,
+    RenderOutput,
+    VisualizationOutput,
+)
+from hyperion.schemas.workflow import (
+    EngagementMetadata,
+    TaskNode,
+    TaskStatus,
+    WorkflowDAG,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent Registry — maps AgentName to the actual agent class
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _instantiate_agent(agent_name: AgentName, bus: Any = None, router: Any = None) -> Any:
+    """Instantiate an agent by name.
+
+    This is NOT a generic factory. Each agent has a specific class with
+    a specific spec and a specific run() method. This function maps
+    AgentName enum values to their concrete classes.
+
+    Agents are instantiated lazily — only when their task is ready to run.
+    This prevents loading all 20 agents into memory at once.
+    """
+    if agent_name == AgentName.ENGAGEMENT_DIRECTOR:
+        return EngagementDirector(bus=bus, router=router)
+    elif agent_name == AgentName.SYNTHESIS_LEAD:
+        return SynthesisLead(bus=bus, router=router)
+    elif agent_name == AgentName.MARKET_ANALYST:
+        from hyperion.agents.specialists.market_analyst import MarketAnalyst
+        return MarketAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.COMPETITIVE_INTEL:
+        from hyperion.agents.specialists.competitive_intel import CompetitiveIntel
+        return CompetitiveIntel(bus=bus, router=router)
+    elif agent_name == AgentName.FINANCIAL_ANALYST:
+        from hyperion.agents.specialists.financial_analyst import FinancialAnalyst
+        return FinancialAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.RISK_ANALYST:
+        from hyperion.agents.specialists.risk_analyst import RiskAnalyst
+        return RiskAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.TECHNOLOGY_ANALYST:
+        from hyperion.agents.specialists.technology_analyst import TechnologyAnalyst
+        return TechnologyAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.OPERATIONS_ANALYST:
+        from hyperion.agents.specialists.operations_analyst import OperationsAnalyst
+        return OperationsAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.REGULATORY_ANALYST:
+        from hyperion.agents.specialists.regulatory_analyst import RegulatoryAnalyst
+        return RegulatoryAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.SUSTAINABILITY_ANALYST:
+        from hyperion.agents.specialists.sustainability_analyst import SustainabilityAnalyst
+        return SustainabilityAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.CONSUMER_INSIGHTS:
+        from hyperion.agents.specialists.consumer_insights import ConsumerInsightsAnalyst
+        return ConsumerInsightsAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.MA_ANALYST:
+        from hyperion.agents.specialists.ma_analyst import MAAnalyst
+        return MAAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.INNOVATION_ANALYST:
+        from hyperion.agents.specialists.innovation_analyst import InnovationAnalyst
+        return InnovationAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.STRATEGY_ANALYST:
+        from hyperion.agents.specialists.strategy_analyst import StrategyAnalyst
+        return StrategyAnalyst(bus=bus, router=router)
+    elif agent_name == AgentName.RESEARCH_LIBRARIAN:
+        from hyperion.agents.support.research_librarian import ResearchLibrarian
+        return ResearchLibrarian(bus=bus, router=router)
+    elif agent_name == AgentName.FACT_CHECKER:
+        from hyperion.agents.support.fact_checker import FactChecker
+        return FactChecker(bus=bus, router=router)
+    elif agent_name == AgentName.DATA_VISUALIZER:
+        from hyperion.agents.support.data_visualizer import DataVisualizer
+        return DataVisualizer(bus=bus, router=router)
+    elif agent_name == AgentName.QUALITY_GATE:
+        from hyperion.agents.support.quality_gate import QualityGate
+        return QualityGate(bus=bus, router=router)
+    elif agent_name == AgentName.PRESENTATION_DESIGNER:
+        from hyperion.agents.delivery.presentation_designer import PresentationDesigner
+        return PresentationDesigner(bus=bus, router=router)
+    elif agent_name == AgentName.RENDER_ENGINE:
+        from hyperion.agents.delivery.render_engine import RenderEngine
+        return RenderEngine(bus=bus, router=router)
+    else:
+        raise ValueError(f"Unknown agent: {agent_name}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engagement Result — the output of a complete engagement
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class EngagementResult:
+    """The result of a complete HYPERION engagement.
+
+    This is the final output of the orchestrator. It contains:
+    - The final PDF path (the deliverable)
+    - The FinalReport model (the analysis)
+    - The QualityScore (the rubric score)
+    - Engagement metadata (for the methodology page and Second Brain)
+    - Success/failure status
+    """
+
+    engagement_id: str = ""
+    question: str = ""
+    pdf_path: str = ""
+    markdown_path: str = ""
+    final_report: FinalReport | None = None
+    quality_score: QualityScore | None = None
+    fact_check_report: FactCheckReport | None = None
+    layout_plan: LayoutPlan | None = None
+    visualization_output: VisualizationOutput | None = None
+    render_output: RenderOutput | None = None
+    metadata: EngagementMetadata | None = None
+    dag: WorkflowDAG | None = None
+    success: bool = False
+    error: str = ""
+    duration_seconds: float = 0.0
+    adaptation_count: int = 0
+    escalation_count: int = 0
+    quality_iterations: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "engagement_id": self.engagement_id,
+            "question": self.question,
+            "pdf_path": self.pdf_path,
+            "markdown_path": self.markdown_path,
+            "success": self.success,
+            "error": self.error,
+            "duration_seconds": self.duration_seconds,
+            "adaptation_count": self.adaptation_count,
+            "escalation_count": self.escalation_count,
+            "quality_iterations": self.quality_iterations,
+            "quality_score": self.quality_score.model_dump() if self.quality_score else None,
+            "final_report": self.final_report.model_dump() if self.final_report else None,
+            "metadata": self.metadata.model_dump() if self.metadata else None,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workflow Engine — the orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class WorkflowEngine:
+    """The HYPERION Workflow Engine — executes the dynamic engagement DAG.
+
+    This is NOT a generic task runner. It is the specific implementation of
+    the 5-stage pipeline from §4.9:
+
+    Stage 1: Engagement Director → WorkflowDAG (planning)
+    Stage 2: Specialists execute in parallel with dependency resolution
+    Stage 3: Fact Checker verifies findings (parallel with Synthesis)
+    Stage 4: Synthesis Lead → FinalReport → Quality Gate (with iteration loop)
+    Stage 5: Presentation Designer → Data Visualizer → Render Engine → PDF
+
+    The engine:
+    1. Receives the WorkflowDAG from the Engagement Director
+    2. Instantiates agents lazily (only when their task is ready)
+    3. Executes tasks in topological order — independent tasks in parallel
+    4. Collects outputs from each agent and passes them to dependent agents
+    5. Monitors the bus for escalations — the Director handles adaptive replanning
+    6. Runs the Quality Gate iteration loop (max 3 iterations, §4.5 Agent 18)
+    7. Produces the final PDF via the Render Engine
+    8. Saves engagement context to Second Brain for future learning
+
+    Usage:
+        engine = WorkflowEngine()
+        result = await engine.run_engagement(
+            question="Should we enter the Tier-2 Indian SaaS market?",
+            conversation_context="Client is a B2B SaaS company...",
+        )
+        if result.success:
+            print(f"PDF: {result.pdf_path}")
+    """
+
+    MAX_QUALITY_ITERATIONS = 3  # §4.5 Agent 18: max 3 iterations before escalation
+    TASK_TIMEOUT_SECONDS = 300  # 5 minutes per task (matches sub-agent timeout, §4.7)
+
+    def __init__(self, bus: Any = None, router: Any = None) -> None:
+        self.bus = bus or get_bus()
+        self.router = router
+        self._director: EngagementDirector | None = None
+        self._agent_instances: dict[AgentName, Any] = {}
+        self._task_outputs: dict[str, Any] = {}  # task_id → agent output
+        self._all_findings: list[Any] = []  # collected from bus
+        self._start_time: float = 0.0
+        self._engagement_id: str = ""
+
+    def _get_agent(self, agent_name: AgentName) -> Any:
+        """Get or instantiate an agent lazily.
+
+        Agents are singletons within an engagement — instantiated once,
+        reused for subsequent tasks (e.g., if the same agent is re-run
+        during a quality iteration).
+        """
+        if agent_name not in self._agent_instances:
+            self._agent_instances[agent_name] = _instantiate_agent(
+                agent_name, bus=self.bus, router=self.router
+            )
+        return self._agent_instances[agent_name]
+
+    async def _execute_task(self, task: TaskNode, dag: WorkflowDAG) -> Any:
+        """Execute a single task — instantiate the agent and call its run() method.
+
+        This is NOT a generic "call the agent" function. It maps each task
+        to the specific arguments that agent's run() method expects, based
+        on the agent's role in the pipeline:
+
+        - Specialists receive: question, engagement_id, context (prior findings)
+        - Fact Checker receives: question, engagement_id, findings
+        - Synthesis Lead receives: engagement_id, question, dag
+        - Quality Gate receives: question, engagement_id, final_report, fact_check_report
+        - Presentation Designer receives: question, engagement_id, final_report, quality_score
+        - Data Visualizer receives: question, engagement_id, chart_specs
+        - Render Engine receives: question, engagement_id, layout_plan
+
+        The task is marked RUNNING before execution and COMPLETED/FAILED after.
+        """
+        agent = self._get_agent(task.agent)
+        task.status = TaskStatus.RUNNING
+        task.started_at = time.time()
+
+        # Build context from dependency outputs
+        context: dict[str, Any] = {}
+        for dep_id in task.dependencies:
+            if dep_id in self._task_outputs:
+                dep_output = self._task_outputs[dep_id]
+                dep_task = dag.get_task(dep_id)
+                if dep_task:
+                    context[dep_task.agent.value] = dep_output
+
+        try:
+            # Call the agent's run() method with the right arguments
+            if task.agent in (
+                AgentName.MARKET_ANALYST, AgentName.COMPETITIVE_INTEL,
+                AgentName.FINANCIAL_ANALYST, AgentName.RISK_ANALYST,
+                AgentName.TECHNOLOGY_ANALYST, AgentName.OPERATIONS_ANALYST,
+                AgentName.REGULATORY_ANALYST, AgentName.SUSTAINABILITY_ANALYST,
+                AgentName.CONSUMER_INSIGHTS, AgentName.MA_ANALYST,
+                AgentName.INNOVATION_ANALYST, AgentName.STRATEGY_ANALYST,
+            ):
+                # Specialists
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=task.description,
+                        engagement_id=self._engagement_id,
+                        context=context if context else None,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.FACT_CHECKER:
+                # Fact Checker needs all findings
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=dag.question,
+                        engagement_id=self._engagement_id,
+                        findings=self._all_findings or None,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.SYNTHESIS_LEAD:
+                # Synthesis Lead needs the DAG and all findings
+                result = await asyncio.wait_for(
+                    agent.run(
+                        engagement_id=self._engagement_id,
+                        question=dag.question,
+                        dag=dag,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.QUALITY_GATE:
+                # Quality Gate needs FinalReport + FactCheckReport
+                final_report = self._get_output_by_agent(dag, AgentName.SYNTHESIS_LEAD)
+                fact_check = self._get_output_by_agent(dag, AgentName.FACT_CHECKER)
+                viz_output = self._get_output_by_agent(dag, AgentName.DATA_VISUALIZER)
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=dag.question,
+                        engagement_id=self._engagement_id,
+                        final_report=final_report,
+                        fact_check_report=fact_check,
+                        visualization_output=viz_output,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.PRESENTATION_DESIGNER:
+                # Presentation Designer needs FinalReport + QualityScore
+                final_report = self._get_output_by_agent(dag, AgentName.SYNTHESIS_LEAD)
+                quality_score = self._get_output_by_agent(dag, AgentName.QUALITY_GATE)
+                viz_output = self._get_output_by_agent(dag, AgentName.DATA_VISUALIZER)
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=dag.question,
+                        engagement_id=self._engagement_id,
+                        final_report=final_report,
+                        quality_score=quality_score,
+                        visualization_output=viz_output,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.DATA_VISUALIZER:
+                # Data Visualizer needs chart specs from Presentation Designer
+                # or from the FinalReport's chart specifications
+                final_report = self._get_output_by_agent(dag, AgentName.SYNTHESIS_LEAD)
+                chart_specs: list[dict[str, Any]] = []
+                if final_report and hasattr(final_report, "chart_specifications"):
+                    chart_specs = final_report.chart_specifications or []
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=dag.question,
+                        engagement_id=self._engagement_id,
+                        chart_specs=chart_specs if chart_specs else None,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.RENDER_ENGINE:
+                # Render Engine needs layout plan from Presentation Designer
+                layout_plan = self._get_output_by_agent(dag, AgentName.PRESENTATION_DESIGNER)
+                viz_output = self._get_output_by_agent(dag, AgentName.DATA_VISUALIZER)
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=dag.question,
+                        engagement_id=self._engagement_id,
+                        layout_plan=layout_plan,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            elif task.agent == AgentName.RESEARCH_LIBRARIAN:
+                # Research Librarian
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=task.description,
+                        engagement_id=self._engagement_id,
+                        context=context if context else None,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            else:
+                # Unknown agent type — try generic call
+                result = await asyncio.wait_for(
+                    agent.run(
+                        question=task.description,
+                        engagement_id=self._engagement_id,
+                    ),
+                    timeout=self.TASK_TIMEOUT_SECONDS,
+                )
+
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = time.time()
+            task.output = result.model_dump() if hasattr(result, "model_dump") else str(result)
+            self._task_outputs[task.id] = result
+
+            # Collect findings for Fact Checker and Synthesis Lead
+            if hasattr(agent, "_findings"):
+                self._all_findings.extend(agent._findings)
+
+            return result
+
+        except asyncio.TimeoutError:
+            task.status = TaskStatus.FAILED
+            task.error = f"Task timed out after {self.TASK_TIMEOUT_SECONDS}s"
+            return None
+        except (ValueError, RuntimeError, OSError) as e:
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            return None
+
+    def _get_output_by_agent(self, dag: WorkflowDAG, agent_name: AgentName) -> Any:
+        """Get the output of a completed task by agent name."""
+        for task in dag.tasks:
+            if task.agent == agent_name and task.id in self._task_outputs:
+                return self._task_outputs[task.id]
+        return None
+
+    async def _execute_wave(self, tasks: list[TaskNode], dag: WorkflowDAG) -> list[Any]:
+        """Execute a wave of independent tasks in parallel via asyncio.gather.
+
+        Tasks in the same wave have no dependencies on each other — they
+        can all run simultaneously. This is the parallelism that makes
+        HYPERION fast. (§4.9: "Tasks with no dependencies run in parallel")
+        """
+        if not tasks:
+            return []
+
+        coroutines = [self._execute_task(task, dag) for task in tasks]
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+
+        # Handle exceptions — don't let one failure kill the wave
+        processed: list[Any] = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                tasks[i].status = TaskStatus.FAILED
+                tasks[i].error = str(result)
+                processed.append(None)
+            else:
+                processed.append(result)
+
+        return processed
+
+    async def _execute_dag(self, dag: WorkflowDAG) -> dict[str, Any]:
+        """Execute the entire DAG in topological order with parallelism.
+
+        This is the core execution loop:
+        1. Get all ready tasks (pending with all dependencies completed)
+        2. Execute them in parallel via asyncio.gather
+        3. Repeat until all tasks are in terminal states
+
+        The Director monitors the bus for escalations and can adapt the
+        DAG mid-execution (add/remove tasks, reroute dependencies).
+        """
+        max_iterations = 100  # Safety valve — prevent infinite loops
+        iteration = 0
+
+        while not dag.is_complete and iteration < max_iterations:
+            iteration += 1
+
+            # Get ready tasks (pending with all dependencies met)
+            ready_tasks = dag.get_ready_tasks()
+            if not ready_tasks:
+                # No ready tasks but DAG not complete — check for deadlocks
+                running = dag.get_running_tasks()
+                if not running:
+                    # Deadlock — no tasks running and none ready
+                    # Mark remaining tasks as failed
+                    for task in dag.tasks:
+                        if task.status == TaskStatus.PENDING:
+                            task.status = TaskStatus.FAILED
+                            task.error = "Deadlock — dependencies never satisfied"
+                    break
+                # Wait for running tasks to complete
+                await asyncio.sleep(0.5)
+                continue
+
+            # Execute the wave
+            await self._execute_wave(ready_tasks, dag)
+
+            # Brief yield to allow bus messages to propagate
+            await asyncio.sleep(0.1)
+
+        # Collect all outputs
+        return dict(self._task_outputs)
+
+    async def _quality_iteration_loop(
+        self,
+        dag: WorkflowDAG,
+        final_report: FinalReport,
+        fact_check_report: FactCheckReport | None,
+    ) -> tuple[FinalReport, QualityScore, int]:
+        """Run the Quality Gate iteration loop (§4.5 Agent 18).
+
+        The Quality Gate scores the report on a 10-dimension rubric.
+        If score < 4.0/5.0, the Synthesis Lead iterates with targeted
+        fixes. Max 3 iterations before escalation.
+
+        Returns: (final_report, quality_score, iterations_run)
+        """
+        quality_agent = self._get_agent(AgentName.QUALITY_GATE)
+        synthesis_agent = self._get_agent(AgentName.SYNTHESIS_LEAD)
+
+        current_report = final_report
+        current_score: QualityScore | None = None
+        iterations = 0
+
+        for iteration in range(1, self.MAX_QUALITY_ITERATIONS + 1):
+            iterations = iteration
+
+            # Score the report
+            current_score = await quality_agent.run(
+                question=dag.question,
+                engagement_id=self._engagement_id,
+                final_report=current_report,
+                fact_check_report=fact_check_report,
+                iteration=iteration,
+            )
+
+            if current_score is None:
+                break
+
+            # Check if score meets threshold (≥ 4.0/5.0)
+            if current_score.weighted_total >= 4.0:
+                break  # Quality threshold met
+
+            # Score below threshold — iterate
+            if iteration < self.MAX_QUALITY_ITERATIONS:
+                # Synthesis Lead fixes the identified gaps
+                fixed_report = await synthesis_agent.run(
+                    engagement_id=self._engagement_id,
+                    question=dag.question,
+                    dag=dag,
+                )
+                if fixed_report is not None:
+                    current_report = fixed_report
+            # If this was the last iteration, proceed with what we have
+
+        return current_report, current_score or QualityScore(
+            engagement_id=self._engagement_id,
+            iteration=iterations,
+            dimensions={},
+            weighted_total=0.0,
+            approved=False,
+            gaps_identified=["Quality Gate did not produce a score"],
+        ), iterations
+
+    async def _save_to_second_brain(self, result: EngagementResult) -> None:
+        """Save engagement context to the Second Brain vault for future learning.
+
+        HYPERION is a learning system (§12.8). Every engagement saves:
+        - The question and question type
+        - The agents used and their findings
+        - The final recommendation and confidence
+        - The quality score
+        - Key sources accessed
+
+        This makes the system smarter over time — future engagements on
+        similar topics can retrieve this context via the Second Brain.
+        """
+        if not result.final_report or not result.metadata:
+            return
+
+        try:
+            from hyperion.tools.second_brain import SecondBrainClient
+            from hyperion.config import get_settings
+
+            settings = get_settings()
+            brain = SecondBrainClient(settings=settings)
+
+            # Save as an engagement note
+            note_content = (
+                f"# Engagement: {result.question}\n\n"
+                f"**Date:** {time.strftime('%Y-%m-%d')}\n"
+                f"**ID:** {result.engagement_id}\n"
+                f"**Question Type:** {result.dag.question_type.value if result.dag else 'unknown'}\n"
+                f"**Recommendation:** {result.final_report.recommendation.value}\n"
+                f"**Confidence:** {result.final_report.confidence.value}\n"
+                f"**Quality Score:** {result.quality_score.weighted_total:.1f}/5.0\n"
+                f"**Duration:** {result.duration_seconds:.0f}s\n"
+                f"**Agents Used:** {', '.join(a.value for a in result.metadata.agents_used)}\n"
+                f"**Sources Accessed:** {result.metadata.sources_accessed}\n"
+                f"**LLM Calls:** {result.metadata.llm_calls_made}\n"
+                f"**Adaptations:** {result.adaptation_count}\n\n"
+                f"## Rationale\n{result.final_report.recommendation_rationale}\n\n"
+                f"## Critical Assumptions\n"
+            )
+            for assumption in result.final_report.critical_assumptions:
+                note_content += f"- {assumption}\n"
+
+            await brain.save_note(
+                category="engagements",
+                title=f"Engagement {result.engagement_id}: {result.question[:60]}",
+                content=note_content,
+                tags=[
+                    result.dag.question_type.value if result.dag else "general",
+                    result.final_report.recommendation.value,
+                    result.final_report.confidence.value,
+                ],
+            )
+        except (ImportError, ValueError, OSError, RuntimeError):
+            # Second Brain save is best-effort — don't fail the engagement
+            pass
+
+    async def _generate_markdown(
+        self,
+        final_report: FinalReport,
+        engagement_id: str,
+    ) -> str:
+        """Generate a markdown export of the report for TUI display.
+
+        The TUI Deliverable View (§8.2) can display the report as markdown
+        using Rich Markdown rendering, in addition to the PDF.
+        """
+        try:
+            from hyperion.output.markdown import MarkdownExporter
+
+            exporter = MarkdownExporter()
+            report_dict = final_report.model_dump()
+            result = exporter.export_to_file(report_dict)
+            return result.file_path if result.success else ""
+        except (ImportError, ValueError, OSError):
+            return ""
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Main entry point — run a complete engagement
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def run_engagement(
+        self,
+        question: str,
+        conversation_context: str = "",
+    ) -> EngagementResult:
+        """Run a complete HYPERION engagement from question to PDF.
+
+        This is the main entry point. It executes the full 5-stage pipeline:
+
+        Stage 1: Engagement Director decomposes question → WorkflowDAG
+        Stage 2: Specialists execute in parallel with dependency resolution
+        Stage 3: Fact Checker verifies findings (parallel with Synthesis)
+        Stage 4: Synthesis Lead → FinalReport → Quality Gate (with iteration)
+        Stage 5: Presentation Designer → Data Visualizer → Render Engine → PDF
+
+        Returns an EngagementResult with the PDF path and all metadata.
+        """
+        self._start_time = time.time()
+        self._engagement_id = f"eng_{uuid.uuid4().hex[:12]}"
+
+        # Reset the bus for a clean engagement
+        reset_bus()
+        self.bus = get_bus()
+
+        result = EngagementResult(
+            engagement_id=self._engagement_id,
+            question=question,
+        )
+
+        try:
+            # ─────────────────────────────────────────────────────────────
+            # Stage 1: Engagement Director — decompose and plan
+            # ─────────────────────────────────────────────────────────────
+            self._director = EngagementDirector(bus=self.bus, router=self.router)
+            dag = await self._director.run(
+                question=question,
+                conversation_context=conversation_context,
+            )
+            result.dag = dag
+
+            # ─────────────────────────────────────────────────────────────
+            # Stage 2-4: Execute the DAG (specialists → fact check → synthesis → quality)
+            # ─────────────────────────────────────────────────────────────
+            await self._execute_dag(dag)
+
+            # Collect key outputs
+            final_report = self._get_output_by_agent(dag, AgentName.SYNTHESIS_LEAD)
+            fact_check_report = self._get_output_by_agent(dag, AgentName.FACT_CHECKER)
+
+            if not final_report:
+                result.error = "Synthesis Lead did not produce a FinalReport"
+                result.duration_seconds = time.time() - self._start_time
+                return result
+
+            result.final_report = final_report
+            result.fact_check_report = fact_check_report
+
+            # ─────────────────────────────────────────────────────────────
+            # Stage 4b: Quality Gate iteration loop
+            # ─────────────────────────────────────────────────────────────
+            final_report, quality_score, iterations = await self._quality_iteration_loop(
+                dag, final_report, fact_check_report
+            )
+            result.final_report = final_report
+            result.quality_score = quality_score
+            result.quality_iterations = iterations
+
+            # Update the task outputs with the iterated report
+            self._task_outputs["task_synthesis_lead"] = final_report
+            self._task_outputs["task_quality_gate"] = quality_score
+
+            # ─────────────────────────────────────────────────────────────
+            # Stage 5: Delivery — Presentation Designer → Data Viz → Render
+            # ─────────────────────────────────────────────────────────────
+            # Execute remaining delivery tasks
+            delivery_tasks = [
+                t for t in dag.tasks
+                if t.agent in (
+                    AgentName.PRESENTATION_DESIGNER,
+                    AgentName.DATA_VISUALIZER,
+                    AgentName.RENDER_ENGINE,
+                )
+                and t.status == TaskStatus.PENDING
+            ]
+
+            # Execute delivery tasks in order (they have dependencies)
+            for task in delivery_tasks:
+                if task.status == TaskStatus.PENDING:
+                    # Check if dependencies are met
+                    ready = all(
+                        dag.get_task(dep) and dag.get_task(dep).status == TaskStatus.COMPLETED
+                        for dep in task.dependencies
+                    )
+                    if ready:
+                        await self._execute_task(task, dag)
+
+            # Collect delivery outputs
+            result.layout_plan = self._get_output_by_agent(dag, AgentName.PRESENTATION_DESIGNER)
+            result.visualization_output = self._get_output_by_agent(dag, AgentName.DATA_VISUALIZER)
+            result.render_output = self._get_output_by_agent(dag, AgentName.RENDER_ENGINE)
+
+            # Get PDF path
+            if result.render_output and hasattr(result.render_output, "pdf_path"):
+                result.pdf_path = result.render_output.pdf_path
+            elif result.layout_plan and hasattr(result.layout_plan, "pdf_path"):
+                result.pdf_path = result.layout_plan.pdf_path
+
+            # Generate markdown export
+            result.markdown_path = await self._generate_markdown(
+                final_report, self._engagement_id
+            )
+
+            # ─────────────────────────────────────────────────────────────
+            # Build engagement metadata
+            # ─────────────────────────────────────────────────────────────
+            result.metadata = EngagementMetadata(
+                engagement_id=self._engagement_id,
+                question=question,
+                question_type=dag.question_type,
+                agents_used=dag.agents_selected,
+                sources_accessed=sum(
+                    1 for f in self._all_findings if hasattr(f, "sources") and f.sources
+                ),
+                data_points_collected=len(self._all_findings),
+                duration_seconds=time.time() - self._start_time,
+                llm_calls_made=sum(t.estimated_llm_calls for t in dag.tasks if t.status == TaskStatus.COMPLETED),
+                tokens_consumed=sum(t.estimated_tokens for t in dag.tasks if t.status == TaskStatus.COMPLETED),
+                sub_agents_spawned=sum(
+                    len(t.sub_agents) for t in dag.tasks if t.status == TaskStatus.COMPLETED
+                ),
+                quality_iterations=iterations,
+                final_quality_score=quality_score.weighted_total if quality_score else None,
+            )
+
+            result.duration_seconds = time.time() - self._start_time
+            result.adaptation_count = len(dag.adaptation_log)
+            result.escalation_count = self._director.get_escalation_count() if self._director else 0
+            result.success = True
+
+            # ─────────────────────────────────────────────────────────────
+            # Save to Second Brain for future learning (§12.8)
+            # ─────────────────────────────────────────────────────────────
+            await self._save_to_second_brain(result)
+
+            return result
+
+        except (ValueError, RuntimeError, OSError, asyncio.TimeoutError) as e:
+            result.error = str(e)
+            result.duration_seconds = time.time() - self._start_time
+            return result
+
+    async def close(self) -> None:
+        """Clean up resources."""
+        # Close any agents that have cleanup methods
+        for agent in self._agent_instances.values():
+            if hasattr(agent, "close"):
+                try:
+                    await agent.close()
+                except (RuntimeError, OSError):
+                    pass
+
+    async def __aenter__(self) -> WorkflowEngine:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience function — run a single engagement
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def run_engagement(
+    question: str,
+    conversation_context: str = "",
+) -> EngagementResult:
+    """Run a complete HYPERION engagement.
+
+    Convenience function that creates a WorkflowEngine, runs the engagement,
+    and cleans up.
+
+    Usage:
+        result = await run_engagement("Should we enter the Tier-2 Indian SaaS market?")
+        if result.success:
+            print(f"PDF: {result.pdf_path}")
+    """
+    engine = WorkflowEngine()
+    try:
+        return await engine.run_engagement(
+            question=question,
+            conversation_context=conversation_context,
+        )
+    finally:
+        await engine.close()
