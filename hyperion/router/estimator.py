@@ -86,11 +86,12 @@ class TokenEstimator:
         Uses the conservative formula from §3.4, then applies a calibration
         factor if we have historical data for this (agent, model) pair.
         """
-        input_chars = len(system_prompt) + len(user_prompt)
+        combined = system_prompt + user_prompt
+        input_chars = len(combined)
 
         # Detect if the prompt is code-heavy (structured data, JSON, code blocks)
         # Simple heuristic: if >30% of chars are non-alpha, treat as code
-        alpha_count = sum(1 for c in input_chars if c.isalpha())
+        alpha_count = sum(1 for c in combined if c.isalpha())
         alpha_ratio = alpha_count / max(1, input_chars)
         chars_per_token = _CHARS_PER_TOKEN_CODE if alpha_ratio < 0.7 else _CHARS_PER_TOKEN_ENGLISH
 
@@ -105,8 +106,9 @@ class TokenEstimator:
 
     def estimate_input_tokens(self, system_prompt: str, user_prompt: str) -> int:
         """Estimate input tokens only (no output budget)."""
-        input_chars = len(system_prompt) + len(user_prompt)
-        alpha_count = sum(1 for c in input_chars if c.isalpha())
+        combined = system_prompt + user_prompt
+        input_chars = len(combined)
+        alpha_count = sum(1 for c in combined if c.isalpha())
         alpha_ratio = alpha_count / max(1, input_chars)
         chars_per_token = _CHARS_PER_TOKEN_CODE if alpha_ratio < 0.7 else _CHARS_PER_TOKEN_ENGLISH
         return input_chars // chars_per_token

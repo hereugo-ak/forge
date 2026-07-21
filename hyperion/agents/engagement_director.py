@@ -519,8 +519,14 @@ class EngagementDirector(BaseAgent):
         try:
             brain = self.get_tool(ToolName.SECOND_BRAIN)
             results = await brain.search(question)
-            return results if results else ""
-        except (ValueError, AttributeError, RuntimeError):
+            if not results or not results.notes:
+                return ""
+            # Convert VaultSearchResult to a string summary for context
+            parts: list[str] = []
+            for note, score in results.notes:
+                parts.append(f"[{score:.2f}] {note.title}: {note.content[:200]}")
+            return "\n".join(parts)
+        except (ValueError, AttributeError, RuntimeError, TypeError):
             # Tool not available, not initialized, or search failed
             return ""
 
@@ -715,21 +721,34 @@ class EngagementDirector(BaseAgent):
 
         # Build research domains from LLM output or heuristic
         llm_domains = getattr(self, "_llm_research_domains", [])
+        if not isinstance(llm_domains, list):
+            llm_domains = []
 
         if llm_domains:
             for i, domain_data in enumerate(llm_domains):
+                if not isinstance(domain_data, dict):
+                    continue
                 try:
                     agent_name = AgentName(domain_data.get("agent", "market_analyst"))
-                except ValueError:
+                except (ValueError, TypeError):
                     agent_name = AgentName.MARKET_ANALYST
+
+                # Coerce priority to int — LLMs sometimes return "high"/"low"
+                raw_priority = domain_data.get("priority", 3)
+                if isinstance(raw_priority, int):
+                    priority = raw_priority
+                elif isinstance(raw_priority, str) and raw_priority.isdigit():
+                    priority = int(raw_priority)
+                else:
+                    priority = 3
 
                 domain = ResearchDomain(
                     id=f"domain_{i+1}",
-                    name=domain_data.get("name", f"Domain {i+1}"),
-                    question=domain_data.get("question", key_question),
+                    name=str(domain_data.get("name", f"Domain {i+1}")),
+                    question=str(domain_data.get("question", key_question)),
                     primary_agent=agent_name,
-                    priority=domain_data.get("priority", 3),
-                    rationale=domain_data.get("rationale", ""),
+                    priority=priority,
+                    rationale=str(domain_data.get("rationale", "")),
                 )
                 domains.append(domain)
         else:
