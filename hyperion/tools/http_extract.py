@@ -20,8 +20,11 @@ This module implements the httpx+Trafilatura tier.
 from __future__ import annotations
 
 import logging
+import random
+import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -34,6 +37,14 @@ MAX_CONTENT_CHARS = 15000
 REQUEST_TIMEOUT = 20  # seconds
 MAX_RETRIES = 2
 RETRY_DELAY = 1  # seconds
+
+# Per-host jitter — random delay before each request to avoid burst patterns
+JITTER_MIN = 0.5  # seconds
+JITTER_MAX = 2.5  # seconds
+
+# Track last request time per host for rate limiting
+_host_last_request: dict[str, float] = {}
+MIN_HOST_INTERVAL = 1.0  # min seconds between requests to same host
 
 # Realistic browser headers to avoid basic bot detection
 DEFAULT_HEADERS: dict[str, str] = {
@@ -93,6 +104,17 @@ class HttpExtractClient:
     def __init__(self, settings: Any | None = None) -> None:
         self.settings = settings
         self._client: httpx.AsyncClient | None = None
+        self._use_curl_cffi = False
+        self._curl_cffi_session: Any | None = None
+
+        # Check if curl_cffi is available for TLS fingerprint impersonation
+        try:
+            from curl_cffi.requests import AsyncSession  # noqa: F401
+
+            self._use_curl_cffi = True
+            logger.info("HTTP Extract: curl_cffi available — using TLS fingerprint impersonation")
+        except ImportError:
+            logger.info("HTTP Extract: curl_cffi not available — using httpx fallback")
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -103,6 +125,47 @@ class HttpExtractClient:
                 max_redirects=5,
             )
         return self._client
+
+    async def _get_curl_cffi_session(self) -> Any:
+        if self._curl_cffi_session is None:
+            from curl_cffi.requests import AsyncSession
+
+            self._curl_cffi_session = AsyncSession(impersonate="chrome")
+        return self._curl_cffi_session
+
+    async def _fetch_html(self, url: str) -> tuple[str, int]:
+        """Fetch HTML from URL using curl_cffi if available, else httpx.
+
+        Returns (html_content, status_code). Raises on network errors.
+        """
+        import asyncio
+
+        # Per-host jitter — wait before request to avoid burst patterns
+        host = urlparse(url).netloc
+        now = time.monotonic()
+        last = _host_last_request.get(host, 0.0)
+        elapsed = now - last
+        if elapsed < MIN_HOST_INTERVAL:
+            wait = MIN_HOST_INTERVAL - elapsed + random.uniform(JITTER_MIN, JITTER_MAX)
+            await asyncio.sleep(wait)
+        else:
+            # Still add small random jitter
+            await asyncio.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
+        _host_last_request[host] = time.monotonic()
+
+        if self._use_curl_cffi:
+            session = await self._get_curl_cffi_session()
+            response = await session.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+            return response.text, response.status_code
+        else:
+            client = await self._get_client()
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text, response.status_code
 
     async def extract(self, url: str) -> HttpExtractResult:
         """Extract content from a URL using HTTP fetch + trafilatura.
@@ -115,14 +178,10 @@ class HttpExtractClient:
         """
         import asyncio
 
-        client = await self._get_client()
-
         for attempt in range(MAX_RETRIES):
             try:
-                response = await client.get(url)
-                response.raise_for_status()
+                html, status_code = await self._fetch_html(url)
 
-                html = response.text
                 if not html or len(html) < 200:
                     return HttpExtractResult(
                         url=url,
@@ -239,6 +298,18 @@ class HttpExtractClient:
                     error=f"Extraction error: {e!s:.200}",
                 )
 
+            except Exception as e:
+                # curl_cffi errors or other unexpected exceptions
+                logger.debug("HTTP extract failed for %s (attempt %d): %s", url, attempt + 1, e)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                return HttpExtractResult(
+                    url=url,
+                    success=False,
+                    error=f"Fetch error: {e!s:.200}",
+                )
+
         return HttpExtractResult(
             url=url,
             success=False,
@@ -271,10 +342,16 @@ class HttpExtractClient:
         return list(results)
 
     async def close(self) -> None:
-        """Close the HTTP client."""
+        """Close the HTTP client and curl_cffi session."""
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+        if self._curl_cffi_session is not None:
+            try:
+                await self._curl_cffi_session.close()
+            except Exception:
+                pass
+            self._curl_cffi_session = None
 
     async def __aenter__(self) -> HttpExtractClient:
         return self
