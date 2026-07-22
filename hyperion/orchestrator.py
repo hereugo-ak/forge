@@ -792,6 +792,104 @@ class WorkflowEngine:
             max_iterations_reached=True,
         ), iterations
 
+    def _build_floor_report(self, question: str) -> FinalReport | None:
+        """Build a minimal floor-report from collected findings (D13 fix).
+
+        When the Synthesis Lead fails or times out, we still need a
+        FinalReport so the delivery pipeline (Presentation Designer →
+        Data Visualizer → Render Engine) can produce a PDF. This floor
+        report is a best-effort synthesis of whatever findings were
+        collected — not a full reconciliation, but enough to generate
+        a deliverable.
+        """
+        from hyperion.schemas.models import (
+            AnalysisSection,
+            ConfidenceLevel,
+            KeyFinding,
+            Recommendation,
+        )
+
+        findings = self._all_findings
+        if not findings:
+            self._log("FLOOR-REPORT: no findings collected — cannot build floor report")
+            return None
+
+        # Group findings by agent
+        by_agent: dict[str, list[KeyFinding]] = {}
+        for f in findings:
+            agent_name = f.agent if isinstance(f.agent, str) else str(f.agent)
+            if agent_name not in by_agent:
+                by_agent[agent_name] = []
+            by_agent[agent_name].append(f)
+
+        # Build sections from each agent's findings
+        sections: list[AnalysisSection] = []
+        for agent_name, agent_findings in by_agent.items():
+            content_parts = []
+            for f in agent_findings:
+                content_parts.append(
+                    f"**{f.title}** (confidence: {f.confidence.value})\n\n{f.content[:500]}"
+                )
+            sections.append(AnalysisSection(
+                id=f"floor_{agent_name}",
+                title=agent_name.replace("_", " ").title(),
+                agent=agent_name,
+                key_insight=agent_findings[0].title if agent_findings else "No key insight available",
+                body="\n\n---\n\n".join(content_parts) or "No content available",
+                findings=agent_findings,
+                implications="Floor report — implications not synthesized.",
+                confidence=ConfidenceLevel.LOW,
+            ))
+
+        # Build key findings list (top 5 by confidence)
+        confidence_order = {
+            ConfidenceLevel.HIGH: 0,
+            ConfidenceLevel.MEDIUM: 1,
+            ConfidenceLevel.LOW: 2,
+        }
+        key_findings = sorted(
+            findings,
+            key=lambda f: confidence_order.get(f.confidence, 3),
+        )[:5]
+
+        # Build executive summary from findings
+        summary_lines = [
+            f"This report was generated as a floor-report fallback because the "
+            f"Synthesis Lead did not produce a full synthesis. It contains "
+            f"{len(findings)} findings from {len(by_agent)} specialists.",
+            "",
+        ]
+        for f in key_findings:
+            summary_lines.append(f"- {f.title}: {f.content[:150]}")
+
+        return FinalReport(
+            engagement_id=self._engagement_id,
+            question=question,
+            recommendation=Recommendation.INVESTIGATE,
+            recommendation_rationale=(
+                "Insufficient synthesis — the Synthesis Lead did not complete. "
+                "Recommendation defaults to INVESTIGATE pending full analysis. "
+                f"Floor report assembled from {len(findings)} findings."
+            ),
+            critical_assumptions=[
+                "Full synthesis was not completed — findings are not reconciled.",
+                "Contradictions between agents may exist and are not resolved.",
+            ],
+            confidence=ConfidenceLevel.LOW,
+            confidence_breakdown={agent: ConfidenceLevel.LOW for agent in by_agent},
+            executive_summary="\n".join(summary_lines),
+            key_findings=key_findings,
+            sections=sections,
+            agents_used=list(by_agent.keys()),
+            total_sources=sum(1 for f in findings if hasattr(f, "sources") and f.sources),
+            total_data_points=len(findings),
+            limitations=[
+                "Full synthesis was not completed.",
+                "Contradictions are not resolved.",
+                "Quality may be below standard threshold.",
+            ],
+        )
+
     async def _save_to_second_brain(self, result: EngagementResult) -> None:
         """Save engagement context to the Second Brain vault for future learning.
 
@@ -937,9 +1035,26 @@ class WorkflowEngine:
             fact_check_report = self._get_output_by_agent(dag, AgentName.FACT_CHECKER)
 
             if not final_report:
-                result.error = "Synthesis Lead did not produce a FinalReport"
-                result.duration_seconds = time.time() - self._start_time
-                return result
+                # D13 fix: Build a floor-report fallback from collected findings
+                # so delivery (PDF generation) always runs, even if synthesis failed.
+                self._log(
+                    f"SYNTHESIS: no FinalReport produced — building floor-report fallback "
+                    f"from {len(self._all_findings)} collected findings"
+                )
+                final_report = self._build_floor_report(dag.question)
+                if final_report is None:
+                    result.error = "Synthesis Lead did not produce a FinalReport and floor-report fallback failed"
+                    result.duration_seconds = time.time() - self._start_time
+                    return result
+                # Mark synthesis task as completed with the floor report
+                for task in dag.tasks:
+                    if task.agent == AgentName.SYNTHESIS_LEAD and task.status != TaskStatus.COMPLETED:
+                        task.status = TaskStatus.COMPLETED
+                        task.completed_at = time.time()
+                        task.output = final_report.model_dump()
+                        self._task_outputs[task.id] = final_report
+                        self._publish_task_update(task)
+                        break
 
             result.final_report = final_report
             result.fact_check_report = fact_check_report
