@@ -28,6 +28,44 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class FlareBreaker:
+    """Circuit breaker for FlareSolverr — prevents flood after repeated failures.
+
+    D3 fix: after 2 consecutive 5xx/errors, opens a 60s cooldown window
+    during which FlareBreaker.closed() returns False and callers skip
+    FlareSolverr entirely.
+    """
+
+    _fails: int = 0
+    _open_until: float = 0.0
+    THRESHOLD: int = 2
+    COOLDOWN: float = 60.0
+
+    @classmethod
+    def closed(cls) -> bool:
+        return time.time() >= cls._open_until
+
+    @classmethod
+    def record_error(cls) -> None:
+        cls._fails += 1
+        if cls._fails >= cls.THRESHOLD:
+            cls._open_until = time.time() + cls.COOLDOWN
+            cls._fails = 0
+            logger.warning(
+                "FlareBreaker OPEN: %d consecutive errors, cooldown=%.0fs",
+                cls.THRESHOLD, cls.COOLDOWN,
+            )
+
+    @classmethod
+    def record_ok(cls) -> None:
+        cls._fails = 0
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._fails = 0
+        cls._open_until = 0.0
+
+
 @dataclass
 class FlareSolverrResult:
     """Result of a FlareSolverr request."""

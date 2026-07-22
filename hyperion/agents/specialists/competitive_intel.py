@@ -1061,10 +1061,24 @@ class CompetitiveIntel(BaseAgent):
         self._search_results = await self._identify_competitors(self._question)
 
         if not self._competitor_names:
-            await self._transition(
-                AgentState.BLOCKED,
-                "No competitors identified — cannot proceed with competitive analysis",
+            await self._escalate(
+                issue="No competitors identified from search — publishing gap finding",
+                suggested_action="Proceed with degraded analysis; flag data gap in report",
             )
+            gap_finding = KeyFinding(
+                id=f"finding_{uuid.uuid4().hex[:8]}",
+                agent=self.name.value,
+                finding_type="competitive_gap",
+                title="Competitive analysis gap — no competitors identified",
+                content=(
+                    f"No competitors could be identified for the question: "
+                    f"'{self._question[:120]}'. This is a data-availability gap. "
+                    f"Sources checked: {len(self._sources)}."
+                ),
+                confidence=ConfidenceLevel.LOW,
+                sources=self._sources[:3],
+            )
+            await self._publish_finding(gap_finding)
             return CompetitiveLandscape(
                 competitors=[],
                 competitor_matrix={},

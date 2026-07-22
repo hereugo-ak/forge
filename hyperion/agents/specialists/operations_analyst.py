@@ -1089,10 +1089,24 @@ class OperationsAnalyst(BaseAgent):
         process_map = await self._map_process(self._question, self._search_results, self._context)
 
         if not process_map:
-            await self._transition(
-                AgentState.BLOCKED,
-                "No process steps identified — cannot proceed with operations analysis",
+            await self._escalate(
+                issue="No process steps identified from available sources — publishing gap finding",
+                suggested_action="Proceed with degraded analysis; flag data gap in report",
             )
+            gap_finding = KeyFinding(
+                id=f"finding_{uuid.uuid4().hex[:8]}",
+                agent=self.name.value,
+                finding_type="operations_gap",
+                title="Operations analysis gap — insufficient source data",
+                content=(
+                    f"No process steps could be mapped for the question: "
+                    f"'{self._question[:120]}'. This is a data-availability gap, "
+                    f"not an absence of operational activity. Sources checked: {len(self._sources)}."
+                ),
+                confidence=ConfidenceLevel.LOW,
+                sources=self._sources[:3],
+            )
+            await self._publish_finding(gap_finding)
             return OperationsAnalysis(
                 confidence=ConfidenceLevel.LOW,
                 sources=self._sources,

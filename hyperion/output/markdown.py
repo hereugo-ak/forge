@@ -95,11 +95,21 @@ class MarkdownExporter:
         return f"{value:.{decimals}f}%"
 
     def _render_cover(self, report: dict[str, Any]) -> str:
-        """Render the cover page as markdown."""
-        title = report.get("title", "Untitled Report")
-        subtitle = report.get("subtitle", "")
-        client = report.get("client", "")
-        date = report.get("date", datetime.now().strftime("%B %d, %Y"))
+        """Render the cover page as markdown.
+
+        D18 fix: uses FinalReport schema keys (question, engagement_id, generated_at)
+        instead of non-existent title/subtitle/client/date.
+        """
+        title = report.get("question", "Untitled Report")
+        engagement_id = report.get("engagement_id", "")
+        generated_at = report.get("generated_at", "")
+        if generated_at:
+            if isinstance(generated_at, str):
+                date_str = generated_at[:10]
+            else:
+                date_str = str(generated_at)[:10]
+        else:
+            date_str = datetime.now().strftime("%B %d, %Y")
 
         lines = [
             f"# {self.WORDMARK}",
@@ -110,13 +120,10 @@ class MarkdownExporter:
             f"# {title}",
             "",
         ]
-        if subtitle:
-            lines.append(f"### {subtitle}")
+        if engagement_id:
+            lines.append(f"**Engagement:** {engagement_id}")
             lines.append("")
-        if client:
-            lines.append(f"**Prepared for:** {client}")
-            lines.append("")
-        lines.append(f"**Date:** {date}")
+        lines.append(f"**Date:** {date_str}")
         lines.append("")
         lines.append("---")
         lines.append("")
@@ -137,44 +144,64 @@ class MarkdownExporter:
         return "\n".join(lines)
 
     def _render_executive_summary(self, report: dict[str, Any]) -> str:
-        """Render the executive summary."""
-        summary = report.get("executive_summary", {})
-        if not summary:
-            return ""
+        """Render the executive summary.
 
-        # Handle case where LLM returns summary as a string instead of dict
-        if isinstance(summary, str):
-            return f"## Executive Summary\n\n{summary}\n"
-
+        D18 fix: executive_summary is a string in FinalReport, not a dict.
+        key_findings is a list of KeyFinding objects.
+        recommendation and recommendation_rationale are top-level fields.
+        """
         lines = ["## Executive Summary", ""]
 
-        # Key findings
-        key_findings = summary.get("key_findings", [])
+        # Recommendation
+        recommendation = report.get("recommendation", "")
+        if recommendation:
+            rec_str = recommendation if isinstance(recommendation, str) else str(recommendation)
+            lines.append(f"**Recommendation:** {rec_str.replace('_', ' ').title()}")
+            lines.append("")
+
+        rationale = report.get("recommendation_rationale", "")
+        if rationale:
+            lines.append(f"{rationale}")
+            lines.append("")
+
+        # Executive summary text (it's a string, not a dict)
+        summary = report.get("executive_summary", "")
+        if summary and isinstance(summary, str):
+            lines.append(summary)
+            lines.append("")
+
+        # Key findings (list of KeyFinding objects or dicts)
+        key_findings = report.get("key_findings", [])
         if key_findings:
             lines.append("### Key Findings")
             lines.append("")
             for finding in key_findings:
-                lines.append(f"- {finding}")
+                if isinstance(finding, dict):
+                    title = finding.get("title", "")
+                    content = finding.get("content", "")
+                    confidence = finding.get("confidence", "")
+                    lines.append(f"- **{title}**: {content[:200]}")
+                    if confidence:
+                        conf_str = confidence if isinstance(confidence, str) else str(confidence)
+                        lines.append(f"  - *Confidence: {conf_str}*")
+                else:
+                    lines.append(f"- {finding}")
             lines.append("")
 
-        # Recommendations
-        recommendations = summary.get("recommendations", [])
-        if recommendations:
-            lines.append("### Recommendations")
+        # Critical assumptions
+        assumptions = report.get("critical_assumptions", [])
+        if assumptions:
+            lines.append("### Critical Assumptions")
             lines.append("")
-            for rec in recommendations:
-                lines.append(f"- {rec}")
+            for assumption in assumptions:
+                lines.append(f"- {assumption}")
             lines.append("")
 
-        # Key metrics
-        metrics = summary.get("key_metrics", {})
-        if metrics:
-            lines.append("### Key Metrics")
-            lines.append("")
-            lines.append("| Metric | Value |")
-            lines.append("|--------|-------|")
-            for key, value in metrics.items():
-                lines.append(f"| {key} | {value} |")
+        # Confidence
+        confidence = report.get("confidence", "")
+        if confidence:
+            conf_str = confidence if isinstance(confidence, str) else str(confidence)
+            lines.append(f"*Overall Confidence: {conf_str}*")
             lines.append("")
 
         lines.append("---")
@@ -182,29 +209,51 @@ class MarkdownExporter:
         return "\n".join(lines)
 
     def _render_section(self, section: dict[str, Any], index: int) -> str:
-        """Render a single report section."""
+        """Render a single report section.
+
+        D18 fix: uses 'body' instead of 'content', and findings are KeyFinding
+        objects with 'title'/'content'/'confidence'/'sources' fields.
+        """
         title = section.get("title", f"Section {index}")
-        content = section.get("content", "")
+        body = section.get("body", section.get("content", ""))
+        key_insight = section.get("key_insight", "")
 
         lines = [f"## {index}. {title}", ""]
 
-        # Section content (markdown)
-        if content:
-            lines.append(content)
+        # Key insight box
+        if key_insight:
+            lines.append(f"> **Key Insight:** {key_insight}")
             lines.append("")
 
-        # Key findings in this section
+        # Section body (markdown)
+        if body:
+            lines.append(body)
+            lines.append("")
+
+        # Key findings in this section (KeyFinding objects or dicts)
         findings = section.get("findings", [])
         if findings:
             lines.append("### Key Findings")
             lines.append("")
             for finding in findings:
                 if isinstance(finding, dict):
-                    lines.append(f"- **{finding.get('title', '')}**: {finding.get('description', '')}")
-                    if finding.get("confidence"):
-                        lines.append(f"  - *Confidence: {finding.get('confidence', '')}*")
-                    if finding.get("sources"):
-                        lines.append(f"  - *Sources: {', '.join(finding['sources'][:3])}*")
+                    f_title = finding.get("title", "")
+                    f_content = finding.get("content", finding.get("description", ""))
+                    f_conf = finding.get("confidence", "")
+                    lines.append(f"- **{f_title}**: {f_content[:200]}")
+                    if f_conf:
+                        conf_str = f_conf if isinstance(f_conf, str) else str(f_conf)
+                        lines.append(f"  - *Confidence: {conf_str}*")
+                    f_sources = finding.get("sources", [])
+                    if f_sources:
+                        src_titles = []
+                        for s in f_sources[:3]:
+                            if isinstance(s, dict):
+                                src_titles.append(s.get("title", s.get("url", "")))
+                            else:
+                                src_titles.append(str(s))
+                        if src_titles:
+                            lines.append(f"  - *Sources: {', '.join(src_titles)}*")
                 else:
                     lines.append(f"- {finding}")
             lines.append("")
@@ -217,7 +266,7 @@ class MarkdownExporter:
             for chart in charts:
                 if isinstance(chart, dict):
                     caption = chart.get("caption", chart.get("title", ""))
-                    path = chart.get("image_path", "")
+                    path = chart.get("image_path", chart.get("path", ""))
                     source = chart.get("source", "")
                     if path:
                         lines.append(f"![{caption}]({path})")
@@ -226,22 +275,9 @@ class MarkdownExporter:
                     if source:
                         lines.append(f"*Source: {source}*")
                     lines.append("")
-
-        # Tables
-        tables = section.get("tables", [])
-        if tables:
-            lines.append("### Data Tables")
-            lines.append("")
-            for table in tables:
-                if isinstance(table, dict):
-                    headers = table.get("headers", [])
-                    rows = table.get("rows", [])
-                    if headers:
-                        lines.append("| " + " | ".join(headers) + " |")
-                        lines.append("|" + "|".join(["---"] * len(headers)) + "|")
-                        for row in rows:
-                            lines.append("| " + " | ".join(str(cell) for cell in row) + " |")
-                        lines.append("")
+                elif isinstance(chart, str):
+                    lines.append(f"![Chart]({chart})")
+                    lines.append("")
 
         # Images
         images = section.get("images", [])
@@ -249,23 +285,65 @@ class MarkdownExporter:
             for img in images:
                 if isinstance(img, dict):
                     caption = img.get("caption", "")
-                    path = img.get("local_path", img.get("image_path", ""))
+                    path = img.get("local_path", img.get("image_path", img.get("path", "")))
                     photographer = img.get("photographer", "")
                     if path:
                         lines.append(f"![{caption}]({path})")
                     if caption:
                         lines.append(f"*{caption}*")
                     if photographer:
-                        lines.append(f"*Photo: {photographer} via Unsplash*")
+                        lines.append(f"*Photo: {photographer}*")
                     lines.append("")
+                elif isinstance(img, str):
+                    lines.append(f"![Image]({img})")
+                    lines.append("")
+
+        # Implications
+        implications = section.get("implications", "")
+        if implications:
+            lines.append(f"> **So What?** {implications}")
+            lines.append("")
+
+        # Sources
+        sources = section.get("sources", [])
+        if sources:
+            lines.append("### Sources")
+            lines.append("")
+            for src in sources:
+                if isinstance(src, dict):
+                    s_title = src.get("title", "")
+                    s_url = src.get("url", "")
+                    s_cred = src.get("credibility", "")
+                    if s_url:
+                        lines.append(f"- [{s_title}]({s_url})" + (f" — *{s_cred}*" if s_cred else ""))
+                    else:
+                        lines.append(f"- {s_title}")
+                else:
+                    lines.append(f"- {src}")
+            lines.append("")
 
         lines.append("---")
         lines.append("")
         return "\n".join(lines)
 
     def _render_risks(self, report: dict[str, Any]) -> str:
-        """Render the risk section."""
-        risks = report.get("risks", [])
+        """Render the risk section.
+
+        D18 fix: uses 'risk_analysis' (RiskAnalysis model dict) instead of
+        non-existent 'risks' key. RiskAnalysis has 'risks' (list of Risk),
+        'residual_risk_summary', 'confidence'.
+        """
+        risk_analysis = report.get("risk_analysis")
+        if not risk_analysis:
+            return ""
+
+        # Handle RiskAnalysis as dict (from model_dump)
+        if isinstance(risk_analysis, dict):
+            risks = risk_analysis.get("risks", [])
+            residual = risk_analysis.get("residual_risk_summary", "")
+        else:
+            return ""
+
         if not risks:
             return ""
 
@@ -274,61 +352,69 @@ class MarkdownExporter:
         # Risk matrix
         lines.append("### Top Risks")
         lines.append("")
-        lines.append("| # | Risk | Severity | Probability | Mitigation |")
-        lines.append("|---|------|----------|-------------|------------|")
+        lines.append("| # | Risk | Category | Severity | Probability | Mitigation |")
+        lines.append("|---|------|----------|----------|-------------|------------|")
 
         for i, risk in enumerate(risks[:10], 1):
             if isinstance(risk, dict):
                 name = risk.get("name", risk.get("title", ""))
+                category = risk.get("category", "")
                 severity = risk.get("severity", "")
                 probability = risk.get("probability", "")
                 mitigation = risk.get("mitigation", risk.get("recommendation", ""))
-                lines.append(f"| {i} | {name} | {severity} | {probability} | {mitigation} |")
+                lines.append(f"| {i} | {name} | {category} | {severity} | {probability} | {mitigation} |")
 
         lines.append("")
+
+        if residual:
+            lines.append(f"**Residual Risk Summary:** {residual}")
+            lines.append("")
+
         lines.append("---")
         lines.append("")
         return "\n".join(lines)
 
     def _render_methodology(self, report: dict[str, Any]) -> str:
-        """Render the methodology section."""
-        methodology = report.get("methodology", {})
-        if not methodology:
+        """Render the methodology section.
+
+        D18 fix: uses FinalReport top-level fields (agents_used, total_sources,
+        total_data_points, limitations) instead of non-existent 'methodology' dict.
+        """
+        agents_used = report.get("agents_used", [])
+        total_sources = report.get("total_sources", 0)
+        total_data_points = report.get("total_data_points", 0)
+        limitations = report.get("limitations", [])
+
+        if not agents_used and not limitations:
             return ""
 
         lines = ["## Methodology", ""]
 
         # Agents used
-        agents = methodology.get("agents_used", [])
-        if agents:
+        if agents_used:
             lines.append("### Agents Deployed")
             lines.append("")
-            for agent in agents:
+            for agent in agents_used:
                 if isinstance(agent, dict):
                     lines.append(f"- **{agent.get('name', '')}** — {agent.get('role', '')}")
                 else:
                     lines.append(f"- {agent}")
             lines.append("")
 
-        # Data sources
-        sources = methodology.get("data_sources", [])
-        if sources:
-            lines.append("### Data Sources")
+        # Data summary
+        if total_sources or total_data_points:
+            lines.append("### Data Coverage")
             lines.append("")
-            for source in sources:
-                if isinstance(source, dict):
-                    lines.append(f"- {source.get('name', '')} — *{source.get('type', '')}*")
-                else:
-                    lines.append(f"- {source}")
+            lines.append(f"- **Total unique sources:** {total_sources}")
+            lines.append(f"- **Total data points:** {total_data_points}")
             lines.append("")
 
-        # Tools used
-        tools = methodology.get("tools_used", [])
-        if tools:
-            lines.append("### Tools Used")
+        # Limitations
+        if limitations:
+            lines.append("### Limitations")
             lines.append("")
-            for tool in tools:
-                lines.append(f"- {tool}")
+            for limitation in limitations:
+                lines.append(f"- {limitation}")
             lines.append("")
 
         lines.append("---")
@@ -336,35 +422,58 @@ class MarkdownExporter:
         return "\n".join(lines)
 
     def _render_appendix(self, report: dict[str, Any]) -> str:
-        """Render the appendix."""
-        appendix = report.get("appendix", {})
-        if not appendix:
-            return ""
+        """Render the appendix.
 
+        D18 fix: FinalReport has no 'appendix' key. Build appendix from
+        sections' sources and contradictions.
+        """
         lines = ["## Appendix", ""]
 
-        # Sources
-        sources = appendix.get("sources", [])
-        if sources:
+        # Collect all sources from all sections
+        all_sources: list[dict[str, Any]] = []
+        sections = report.get("sections", [])
+        for section in sections:
+            if isinstance(section, dict):
+                sources = section.get("sources", [])
+                for src in sources:
+                    if isinstance(src, dict):
+                        all_sources.append(src)
+
+        # Deduplicate by URL
+        seen_urls: set[str] = set()
+        unique_sources: list[dict[str, Any]] = []
+        for src in all_sources:
+            url = src.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_sources.append(src)
+
+        if unique_sources:
             lines.append("### Sources")
             lines.append("")
-            for i, source in enumerate(sources, 1):
-                if isinstance(source, dict):
-                    title = source.get("title", "")
-                    url = source.get("url", "")
-                    credibility = source.get("credibility", "")
-                    lines.append(f"{i}. [{title}]({url}) — *Credibility: {credibility}*")
+            for i, source in enumerate(unique_sources, 1):
+                title = source.get("title", "")
+                url = source.get("url", "")
+                credibility = source.get("credibility", "")
+                if url:
+                    lines.append(f"{i}. [{title}]({url})" + (f" — *{credibility}*" if credibility else ""))
                 else:
-                    lines.append(f"{i}. {source}")
+                    lines.append(f"{i}. {title}")
             lines.append("")
 
-        # Glossary
-        glossary = appendix.get("glossary", {})
-        if glossary:
-            lines.append("### Glossary")
+        # Contradictions
+        contradictions = report.get("contradictions", [])
+        if contradictions:
+            lines.append("### Contradictions Resolved")
             lines.append("")
-            for term, definition in glossary.items():
-                lines.append(f"- **{term}**: {definition}")
+            for contra in contradictions:
+                if isinstance(contra, dict):
+                    agent_a = contra.get("agent_a", "")
+                    agent_b = contra.get("agent_b", "")
+                    finding_a = contra.get("finding_a", "")
+                    finding_b = contra.get("finding_b", "")
+                    resolution = contra.get("resolution", "unresolved")
+                    lines.append(f"- **{agent_a}** vs **{agent_b}**: {finding_a} vs {finding_b} → {resolution}")
             lines.append("")
 
         lines.append("---")
@@ -394,6 +503,9 @@ class MarkdownExporter:
             MarkdownExportResult with the rendered markdown.
         """
         try:
+            # D18: Accept both FinalReport Pydantic models and plain dicts
+            if hasattr(report_data, "model_dump"):
+                report_data = report_data.model_dump()
             sections_data = report_data.get("sections", [])
 
             # Build the full markdown document

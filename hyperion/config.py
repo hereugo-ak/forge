@@ -150,6 +150,7 @@ GOOGLE_MODELS: list[ModelSpec] = [
         rpd=20,
         tier=ModelTier.DEEP,
         roles=["reserve"],
+        deprecated=True,  # D19: rpd=20 is too low for useful DEEP capacity
     ),
     ModelSpec(
         name="gemini-3-flash",
@@ -160,6 +161,7 @@ GOOGLE_MODELS: list[ModelSpec] = [
         rpd=20,
         tier=ModelTier.DEEP,
         roles=["reserve"],
+        deprecated=True,  # D19: rpd=20 is too low for useful DEEP capacity
     ),
 ]
 
@@ -270,6 +272,18 @@ GROQ_MODELS: list[ModelSpec] = [
         tpd=500_000,
         tier=ModelTier.MICRO,
         roles=["micro backup", "14.4K RPD"],
+    ),
+    # D20: Add a Groq FAST model for secondary FAST capacity
+    ModelSpec(
+        name="llama-3.1-8b-instant",
+        provider=ProviderType.GROQ,
+        context_window=128_000,
+        rpm=30,
+        tpm=30_000,
+        rpd=14_400,
+        tpd=500_000,
+        tier=ModelTier.FAST,
+        roles=["fast secondary", "sub-agent research", "keyword matching"],
     ),
     ModelSpec(
         name="llama-4-scout-17b",

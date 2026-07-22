@@ -1073,6 +1073,19 @@ class WorkflowEngine:
             self._task_outputs["task_synthesis_lead"] = final_report
             self._task_outputs["task_quality_gate"] = quality_score
 
+            # D4-rest: Explicit FinalReport HANDOFF on the bus so delivery
+            # agents receive it via their subscription, not just via local var.
+            await self.bus.publish(
+                channel=Channel.HANDOFF,
+                msg_type=MessageType.HANDOFF,
+                sender=AgentName.SYNTHESIS_LEAD,
+                payload={
+                    "to_agent": "presentation_designer",
+                    "final_report": final_report.model_dump(),
+                    "quality_score": quality_score.model_dump() if quality_score else None,
+                },
+            )
+
             # ─────────────────────────────────────────────────────────────
             # Stage 5: Delivery — Presentation Designer → Data Viz → Render
             # ─────────────────────────────────────────────────────────────
@@ -1098,7 +1111,23 @@ class WorkflowEngine:
                     )
                     if ready:
                         self._log(f"DELIVERY: executing {task.agent.value}")
-                        await self._execute_task(task, dag)
+                        try:
+                            await self._execute_task(task, dag)
+                        except Exception as e:
+                            # D4-rest: Escalate delivery failure instead of crashing
+                            self._log(f"DELIVERY: {task.agent.value} failed: {e!s:.200}")
+                            await self.bus.publish(
+                                channel=Channel.ESCALATION,
+                                msg_type=MessageType.ESCALATION,
+                                sender=task.agent,
+                                payload={
+                                    "agent": task.agent.value,
+                                    "issue": f"Delivery agent failed: {e!s:.200}",
+                                    "suggested_action": "Proceed with partial output or generate stub PDF",
+                                },
+                            )
+                            task.status = TaskStatus.FAILED
+                            task.error = str(e)[:200]
                     else:
                         self._log(f"DELIVERY: {task.agent.value} dependencies not met — skipping")
 

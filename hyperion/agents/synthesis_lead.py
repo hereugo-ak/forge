@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -79,6 +80,8 @@ from hyperion.schemas.models import (
     SourceCredibility,
 )
 from hyperion.schemas.workflow import WorkflowDAG
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -879,7 +882,23 @@ class SynthesisLead(BaseAgent):
             findings: list[KeyFinding],
         ) -> AnalysisSection:
             if not findings:
-                return None  # type: ignore[return-value]
+                return AnalysisSection(
+                    id=f"section_{agent}",
+                    title=agent.replace("_", " ").title(),
+                    agent=agent,
+                    key_insight="No findings available for this section",
+                    body=(
+                        f"The {agent.replace('_', ' ')} analysis did not produce "
+                        f"specific findings for this engagement. This is a data-"
+                        f"availability gap, not an absence of analytical relevance."
+                    ),
+                    findings=[],
+                    charts=[],
+                    images=[],
+                    implications="No specific implications could be derived — data gap.",
+                    sources=[],
+                    confidence=ConfidenceLevel.LOW,
+                )
 
             key_finding = max(findings, key=lambda f: len(f.sources))
             all_sources: list[Source] = []
@@ -919,8 +938,12 @@ class SynthesisLead(BaseAgent):
             try:
                 response = await self._llm_complete(
                     user_prompt=narrative_prompt,
-                    urgency=TaskUrgency.HIGH,
+                    urgency=TaskUrgency.NORMAL,
                     temperature=0.3,
+                    system_prompt_override=(
+                        "You are a senior consultant writing a report section. "
+                        "Write analytical prose, not bullet points."
+                    ),
                 )
                 if response.success and response.content and len(response.content) > 500:
                     section_body = response.content
@@ -942,10 +965,10 @@ class SynthesisLead(BaseAgent):
             )
 
         # Build all sections in parallel — each section's LLM call is independent
+        # D5: include agents with no findings so sections are never missing
         tasks = [
             _build_one_section(agent, findings)
             for agent, findings in self._findings_by_agent.items()
-            if findings
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -953,6 +976,8 @@ class SynthesisLead(BaseAgent):
         for result in results:
             if isinstance(result, AnalysisSection):
                 sections.append(result)
+            elif isinstance(result, Exception):
+                logger.warning("Section build failed: %s", result)
 
         return sections
 
@@ -1140,6 +1165,120 @@ class SynthesisLead(BaseAgent):
             return ""
 
     # ─────────────────────────────────────────────────────────────────────
+    # D5: Combined critical-path + recommendation (single DEEP call)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _identify_and_draft(
+        self,
+        matrix: dict[str, Any],
+        contradictions: list[Contradiction],
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Identify critical path AND draft recommendation in a single DEEP call.
+
+        D5 fix: collapses former steps 5+6 into one LLM call to keep
+        total DEEP calls ≤ 3 (combined + sections + quality-iteration).
+        """
+        findings_summary = self._format_findings_for_llm()
+
+        contradictions_summary = "\n".join(
+            f"- {c.agent_a} vs {c.agent_b}: {c.finding_a} vs {c.finding_b} "
+            f"→ Resolved: {c.resolution or 'unresolved'}"
+            for c in contradictions
+        ) if contradictions else "No contradictions found."
+
+        prompt = (
+            "You are the Synthesis Lead. Do TWO things in one response:\n\n"
+            f"Question: {self._question}\n\n"
+            f"All findings:\n{findings_summary}\n\n"
+            f"Contradictions:\n{contradictions_summary}\n\n"
+            "FIRST: Identify the 2-3 CRITICAL findings — the ones that, if they "
+            "changed, would flip the recommendation.\n\n"
+            "SECOND: Draft the recommendation as JSON with these fields:\n"
+            "{\n"
+            '  "critical_findings": ["finding_title_1", ...],\n'
+            '  "reasoning": "why these are critical",\n'
+            '  "recommendation": "enter|no_go|conditional|investigate|acquire|do_not_acquire|hold",\n'
+            '  "recommendation_rationale": "The evidence chain — specific, not generic",\n'
+            '  "critical_assumptions": ["assumption1", "assumption2"],\n'
+            '  "executive_summary": "Standalone summary for the CEO — recommendation + key findings + critical risks",\n'
+            '  "key_findings_titles": ["3-5 finding titles that support the recommendation"]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- The recommendation must follow from the findings, not from generic reasoning\n"
+            "- Critical assumptions are assumptions that would FLIP the recommendation if wrong\n"
+            "- The executive summary must stand alone — a CEO reads only that page\n"
+            "- Be confident. No hedging. If uncertain, use CONDITIONAL with specific conditions\n"
+        )
+
+        response = await self._llm_complete(
+            user_prompt=prompt,
+            urgency=TaskUrgency.HIGH,
+            temperature=0.4,
+            response_format={"type": "json_object"},
+        )
+
+        fallback_critical: list[str] = []
+        all_findings = self._get_all_findings()
+        fallback_critical = [f.title for f in all_findings[:3]]
+
+        fallback_rec: dict[str, Any] = {
+            "recommendation": "investigate",
+            "recommendation_rationale": "Insufficient data for a definitive recommendation.",
+            "critical_assumptions": [],
+            "executive_summary": "Further research is needed before a recommendation can be made.",
+            "key_findings_titles": [],
+        }
+
+        if not response.success or not response.content:
+            return fallback_critical, fallback_rec
+
+        try:
+            data = json.loads(response.content)
+            critical = data.get("critical_findings", [])
+            if not isinstance(critical, list) or not critical:
+                critical = fallback_critical
+            else:
+                critical = [str(c) for c in critical[:3]]
+
+            rec = {
+                "recommendation": data.get("recommendation", "investigate"),
+                "recommendation_rationale": data.get("recommendation_rationale", ""),
+                "critical_assumptions": data.get("critical_assumptions", []),
+                "executive_summary": data.get("executive_summary", ""),
+                "key_findings_titles": data.get("key_findings_titles", []),
+            }
+            return critical, rec
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("Combined identify+draft JSON parse failed: %s", e)
+            return fallback_critical, fallback_rec
+
+    def _minimal_report(self, reason: str = "") -> FinalReport:
+        """D5: Always return a valid FinalReport, even on total failure."""
+        return FinalReport(
+            engagement_id=self._engagement_id or f"eng_{uuid.uuid4().hex[:12]}",
+            question=self._question or "",
+            recommendation=Recommendation.INVESTIGATE,
+            recommendation_rationale=(
+                f"Synthesis was unable to complete normally: {reason}. "
+                f"This is a degraded report — further research is required."
+            ),
+            critical_assumptions=["Further research is needed to validate any assumptions"],
+            confidence=ConfidenceLevel.LOW,
+            confidence_breakdown={},
+            executive_summary=(
+                f"This is a degraded report. Synthesis could not complete fully: {reason}. "
+                f"The recommendation is INVESTIGATE pending additional research."
+            ),
+            key_findings=self._get_all_findings()[:5],
+            sections=[],
+            contradictions=[],
+            agents_used=self._get_participating_agents(),
+            total_sources=len({s.url for f in self._get_all_findings() for s in f.sources}),
+            total_data_points=len(self._get_all_findings()),
+            limitations=[f"Synthesis incomplete: {reason}"],
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
     # Main execution — the 8-step methodology
     # ─────────────────────────────────────────────────────────────────────
 
@@ -1171,6 +1310,26 @@ class SynthesisLead(BaseAgent):
         self._engagement_id = engagement_id or f"eng_{uuid.uuid4().hex[:12]}"
         self._question = question
         self._dag = dag
+
+        try:
+            return await self._run_synthesis(engagement_id, question, dag)
+        except Exception as e:
+            logger.error("Synthesis run() failed: %s — returning degraded report", e, exc_info=True)
+            await self._escalate(
+                issue=f"Synthesis failed: {e!s:.200}",
+                suggested_action="Use degraded report; check logs for root cause",
+            )
+            degraded = self._minimal_report(reason=str(e)[:200])
+            self._current_report = degraded
+            return degraded
+
+    async def _run_synthesis(
+        self,
+        engagement_id: str,
+        question: str,
+        dag: WorkflowDAG | None,
+    ) -> FinalReport:
+        """Internal synthesis logic — called by run() with try/except guard."""
 
         # Subscribe to bus channels — CORE role, but specifically needs
         # FINDINGS (to collect specialist output) and HANDOFF (for fact
@@ -1222,13 +1381,11 @@ class SynthesisLead(BaseAgent):
         )
         resolved_contradictions = await self._resolve_contradictions(contradictions, matrix)
 
-        # Step 5: Identify critical path
-        await self._transition(AgentState.WORKING, "Identifying critical path to recommendation")
-        critical_path = await self._identify_critical_path(matrix, resolved_contradictions)
-
-        # Step 6: Draft recommendation
-        await self._transition(AgentState.WORKING, "Drafting recommendation with evidence chain")
-        recommendation_data = await self._draft_recommendation(critical_path, resolved_contradictions)
+        # Step 5+6: Identify critical path AND draft recommendation (single DEEP call)
+        await self._transition(AgentState.WORKING, "Identifying critical path + drafting recommendation")
+        critical_path, recommendation_data = await self._identify_and_draft(
+            matrix, resolved_contradictions,
+        )
 
         # Step 7: Calibrate confidence
         await self._transition(AgentState.WORKING, "Calibrating system confidence")

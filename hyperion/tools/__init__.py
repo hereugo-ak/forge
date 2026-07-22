@@ -10,7 +10,9 @@ from hyperion.tools.alpha_vantage import AlphaVantageClient, FundamentalData, St
 from hyperion.tools.crawl4ai import Crawl4AIClient, CrawlResult
 from hyperion.tools.deep_search import DeepSearchClient, DeepSearchResult, ExtractedContent
 from hyperion.tools.evidence_scorer import EvidenceScorer, EvidenceSummary, ScoredResult
-from hyperion.tools.flaresolverr import FlareSolverrClient, FlareSolverrResult
+from hyperion.tools.flaresolverr import FlareBreaker, FlareSolverrClient, FlareSolverrResult
+from hyperion.tools.query_utils import normalize_query
+from hyperion.tools.search_budget import SearchBudget
 from hyperion.tools.fred import FredClient, FREDSeries, FREDSearchResult
 from hyperion.tools.http_extract import HttpExtractClient, HttpExtractResult
 from hyperion.tools.jina import JinaClient, JinaReadResult, JinaSearchResponse, JinaSearchResult
@@ -60,6 +62,10 @@ __all__ = [
     # FlareSolverr
     "FlareSolverrClient",
     "FlareSolverrResult",
+    "FlareBreaker",
+    # Search Budget + Query Hygiene
+    "SearchBudget",
+    "normalize_query",
     # Stealth Search
     "StealthSearchClient",
     "StealthSearchResult",

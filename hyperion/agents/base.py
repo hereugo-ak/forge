@@ -256,7 +256,9 @@ class BaseAgent(ABC):
         elif self.role == AgentRole.SUPPORT:
             channels = {Channel.FINDINGS}
         elif self.role == AgentRole.DELIVERY:
-            channels = {Channel.FINDINGS}
+            # D4-rest: Delivery needs HANDOFF (receives FinalReport from Synthesis)
+            # and FINDINGS (receives viz output, layout plan from other delivery agents)
+            channels = {Channel.FINDINGS, Channel.HANDOFF}
         else:
             channels = {Channel.FINDINGS}
 
@@ -517,6 +519,22 @@ class BaseAgent(ABC):
             self._tools[tool] = self._instantiate_tool(tool)
 
         return self._tools[tool]
+
+    async def get_tool_or_escalate(self, tool: ToolName) -> Any | None:
+        """D4-rest: Get a tool, escalating on failure instead of raising.
+
+        If the tool is unavailable (not in spec, or instantiation fails),
+        publishes an ESCALATION so the director can adapt. Returns None
+        on failure — callers must check and degrade gracefully.
+        """
+        try:
+            return self.get_tool(tool)
+        except (ValueError, RuntimeError, ImportError) as e:
+            await self._escalate(
+                issue=f"Tool {tool.value} unavailable: {e!s:.200}",
+                suggested_action="Degrade gracefully or reroute to alternative tool",
+            )
+            return None
 
     def _instantiate_tool(self, tool: ToolName) -> Any:
         """Instantiate a tool by name.
