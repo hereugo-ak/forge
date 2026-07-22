@@ -1830,3 +1830,236 @@ Every fix above is stated as an **invariant** (a property that must hold for *al
 
 *End of PART III.*
 
+
+---
+---
+
+# PART IV — IS THIS BEST-IN-CLASS? (production-grade gap analysis + SOTA upgrade)
+
+> **The user's question, verbatim:** *"is this the best most robust proprietary production-grade architecture? or we can improve it? better tools? more robust stealth system?"*
+>
+> **Honest one-line answer:** Parts I–III turn HYPERION from *broken* into *working and robust*. They do **not** yet make it *best-in-class*. There is a real, evidence-backed gap between "does not break" and "state-of-the-art production-grade," and this part closes it. Every recommendation below is grounded in 2025–2026 SOTA practice and a live anti-bot benchmark, not opinion — and every recommendation is a general-purpose invariant for a proprietary multi-workflow engine, not a patch for one query. reddit and semantic/academic remain deliberately excluded.
+
+## IV.0 — Honest verdict: where HYPERION sits on the maturity curve
+
+Scored against how a genuinely production-grade research-automation platform is built in 2026:
+
+| Capability axis | Parts I–III target | Best-in-class (2026) | Gap |
+|---|---|---|---|
+| **Orchestration durability** | In-memory DAG + "floor report" fallback | **Durable execution**: event-history persistence, crash-resume, replay (Temporal-style) | 🔴 Large — a process crash still loses the whole run |
+| **Failure model** | Graceful degradation, never-None synthesis | Durable + **idempotent step retries** that resume from last success, not restart | 🟠 Medium |
+| **Extraction** | Jina Reader + curl_cffi httpx + Obscura(fixed) | **Layered by detection surface**: nodriver (CDP layer) / Camoufox (TLS) / curl_cffi (HTTP) / Trafilatura (parse) | 🟠 Medium — wrong primary browser tool named |
+| **Stealth** | 4 conceptual layers (transport/behaviour/identity/browser) | **Shape-coherence** discipline + automation-protocol-fingerprint defeat (direct-CDP) | 🔴 Large — named tools (FlareSolverr/Obscura) don't defeat the layer that actually blocks you |
+| **LLM fabric** | Multi-provider tiers + adjacency ladders | Same + **semantic caching**, **speculative/parallel provider racing**, **structured-output validation loop** | 🟡 Small–Medium |
+| **Quality assurance** | LLM quality-gate + fact-checker | **Offline eval harness** (golden-set scoring, regression gates in CI) | 🔴 Large — no measurable, repeatable quality metric exists |
+| **Observability** | Structured logs + trace ids | Logs + **metrics + distributed traces + per-run cost/latency ledger + replay** | 🟠 Medium |
+| **Cost/rate governance** | WaitGate + DailyBudgetPlanner | Same + **cache-hit-first** + **provider cost-per-token routing** | 🟡 Small |
+| **Reproducibility** | None (non-deterministic run) | **Seeded, replayable runs** with pinned prompts/versions | 🟠 Medium |
+
+**Verdict:** After Parts I–III, HYPERION would be roughly a **solid Level-2 (“reliable”)** system on a 4-level maturity scale. Best-in-class is **Level-4 (“durable, measurable, self-improving”)**. The three biggest missing pillars are: **(1) durable execution**, **(2) an offline evaluation harness**, and **(3) a stealth stack built around shape-coherence and the CDP/automation-protocol layer** — not the tools currently named.
+
+### IV.0.1 What Parts I–III got RIGHT (keep these)
+- The **root-cause diagnosis** is correct and code-verified — do not re-litigate it.
+- **curl_cffi for transport stealth** is validated by benchmark (see IV.3): a 21-line wrapper matched a 130 MB patched Chromium fork on 26/31 real targets. Keep it.
+- **Jina Reader + structured JSON APIs first** is the correct headless-host strategy. Keep it.
+- **Never-None synthesis + guaranteed delivery** is the right *reliability floor*. Keep it — durable execution sits *above* it, not instead of it.
+- **Multi-provider tier fabric with adjacency ladders** is the right shape. Keep it; add caching + racing.
+
+### IV.0.2 What Parts I–III got INCOMPLETE (this part fixes)
+1. **Named the wrong stealth primaries.** FlareSolverr / Obscura / stealth_search do **not** defeat *automation-protocol fingerprinting* (the CDP-handshake layer), which is the layer that actually hard-blocks a headless scraper on Cloudflare Turnstile / DataDome. IV.3 replaces them with the benchmark-winning approach.
+2. **No durability.** A crash, OOM, or sandbox reset loses the entire multi-minute run. IV.1 adds checkpoint/resume.
+3. **No measurable quality.** "McKinsey-grade" is asserted, never measured. IV.1 adds an offline eval harness with a golden set and CI regression gates.
+4. **No reproducibility/replay.** IV.1 adds seeded, replayable runs.
+5. **Under-specified extraction parsing.** "Get the text" is not the same as *clean, boilerplate-stripped, main-content* text. IV.2 adds Trafilatura/readability as the parse layer.
+
+
+---
+
+## IV.1 — Architecture upgrades (from "reliable DAG" to "durable, measurable engine")
+
+### IV.1.1 Durable execution — the single biggest architecture upgrade
+**Problem it solves:** today (and even after Parts I–III) a run lives entirely in one process's memory. A crash, OOM, sandbox reset, or a 25-minute run that dies at minute 24 loses *everything* and starts from zero. That is the defining trait of a *non-production* long-running system.
+
+**SOTA pattern (2026):** *durable execution* — persist an **event history** of every completed step; on restart, **replay** the history to reconstruct state and **resume from the last completed step** instead of restarting. This is the model behind Temporal/Inngest/DBOS. It is strictly stronger than framework "checkpoints" (LangGraph/CrewAI-style), which snapshot state but do not guarantee exactly-once, resumable step execution across crashes.
+
+**How HYPERION should adopt it (proportionate, zero-cost-friendly):**
+- Do **not** require a Temporal cluster. Implement a **lightweight durable layer**: a `RunJournal` (append-only JSONL/SQLite per `run_id`) that records each agent/step as `{step_id, inputs_hash, status, output_ref, ts}`.
+- Every DAG node becomes an **idempotent step**: before executing, check the journal — if this `step_id`+`inputs_hash` already succeeded, **load the cached output** instead of re-running (this also cuts LLM spend and rate-limit pressure).
+- On restart with the same `run_id`, the orchestrator **replays the journal** and continues from the frontier of completed steps.
+- Findings, section drafts, chart specs, and the FinalReport are written to a **content-addressed store** (`artifacts/<run_id>/<step_id>.json`) so replay is cheap and outputs survive a crash.
+- **Result:** a crash at minute 24 resumes at minute 24. Extraction results, specialist findings, and completed sections are never recomputed. This is the jump from Level-2 to Level-3.
+
+### IV.1.2 Blackboard + explicit HANDOFF (supersedes the fragile local-variable handoff)
+Part III (III.3.8) already flagged that the FinalReport travels as a local variable. The SOTA form is a **blackboard architecture**: a single shared, versioned run-state store that every agent reads/writes, with explicit typed HANDOFF messages on the bus. This makes the delivery trio driven by *state presence* ("a FinalReport artifact exists for this run") rather than control-flow reaching a specific line — which is exactly the class of bug that made the designer never run. Combine with the durable journal: the blackboard *is* the content-addressed store.
+
+### IV.1.3 Offline evaluation harness — make "McKinsey-grade" measurable
+**Problem:** quality is currently asserted by an LLM quality-gate at *runtime* with no repeatable, offline metric. You cannot improve what you cannot measure, and you cannot detect a regression when you change a prompt/model.
+**SOTA pattern:** an **eval harness** run in CI, separate from production:
+- A **golden set** of representative queries spanning *all* workflow types HYPERION serves (proprietary/general-purpose — not one example).
+- **Deterministic checks** per report: has ≥N sections, ≥M cited sources, every KeyFinding has a source, no empty sections, no template artifacts (`&lt;`, `C:\`, unrendered `{{ }}`), PDF renders, charts present.
+- **LLM-as-judge rubric** (scored 1–5) on: evidence density, analytical depth, structure, actionability — with the *same* rubric the runtime quality-gate uses, so runtime and offline agree.
+- **Regression gate:** CI fails if golden-set mean score drops > threshold vs the last release. This is what actually holds a quality bar over time.
+
+### IV.1.4 Reproducibility & replay
+- Pin per-run: prompt template versions, model IDs, tool versions, and a **seed** for any stochastic choice (provider ordering, sampling).
+- Persist the full `run_manifest.json` (question, config snapshot, seed, model matrix hash).
+- **Replay mode:** re-run a `run_id` against its journaled inputs to reproduce a report bit-for-bit (LLM nondeterminism aside) — essential for debugging "why did *this* report look thin?" long after the fact.
+
+### IV.1.5 LLM-fabric refinements (on top of Part III P8)
+- **Semantic + exact response cache** keyed on `(tier, normalized_prompt_hash)`: identical or near-identical sub-agent prompts (common across specialists) hit the cache → fewer calls, less rate-limit pressure, faster runs. Pairs perfectly with the durable step cache in IV.1.1.
+- **Speculative provider racing for critical-path DEEP calls:** fire the DEEP synthesis call at the *two* fastest healthy DEEP providers simultaneously, take the first valid structured response, cancel the other. Trades a little quota for large latency/reliability wins on the exact call that most often times out.
+- **Structured-output validation loop:** every `_llm_complete_structured` call validates against the Pydantic schema and, on failure, does one bounded "repair" re-prompt before falling back — instead of discarding the whole result.
+
+### IV.1.6 Observability upgrade (on top of II.9)
+Add to structured logs: **metrics** (per-tier call counts, cache-hit rate, per-tool success rate, per-provider latency), **distributed trace** spanning the whole DAG under one `run_id`, and a **per-run ledger** (tokens, est. cost, wall-clock per stage) written to the manifest. A one-screen **run health table** at completion: each tool available/unavailable, each tier's calls/limit, degraded? yes/no.
+
+
+---
+
+## IV.2 — Better tools (evidence-backed replacements & additions)
+
+> The guiding principle: **match the tool to the detection surface / job**, and prefer tools that work *headless on Linux with zero cost*. Additions are marked ➕; replacements/repositions ♻.
+
+### IV.2.1 Extraction / parsing (the content pipeline)
+- ➕ **Trafilatura** (or `readability-lxml` / `resiliparse`) as the **main-content parse layer**. Getting bytes ≠ getting the article. Trafilatura strips nav/ads/boilerplate and returns clean main text + metadata + optional markdown — this is what turns a fetched page into *usable* findings and is a large, cheap quality win. Runs pure-Python, headless, no browser.
+- ♻ **curl_cffi** promoted to the **default HTTP fetcher** for every non-JS target (validated in IV.3). Replaces bare `httpx` everywhere in the extraction chain.
+- ➕ **nodriver** as the **JS-rendering / hard-anti-bot extractor** (see IV.3 for why it beats Obscura/FlareSolverr/Playwright). Direct-CDP, headless-capable, free (AGPL-3.0 — review license for the proprietary product).
+- ➕ **Camoufox** as the **TLS-shape-alternative** browser for targets that whitelist Firefox / block Chrome-shape.
+- ➕ **Patchright (`channel=chrome`)** as a **drop-in Playwright replacement** if/when the codebase is already Playwright-shaped and a full nodriver rewrite is too costly.
+- ♻ **Obscura** demoted from "primary extractor" to "optional, only if a genuine native Linux binary is present and `obscura serve` is healthy." On the current host it stays disabled (Part III D14).
+- ♻ **FlareSolverr** kept only as an *optional* Cloudflare-IUAM helper, health-checked; it is **not** a general anti-bot answer (it does not defeat automation-protocol fingerprinting) and must never block the chain.
+- **Resulting extraction ladder (final):** structured JSON API → Jina Reader → **curl_cffi + Trafilatura** → **nodriver (system Chrome, direct-CDP)** → **Camoufox (Firefox shape)** → FlareSolverr (IUAM only). Climb only when the current rung is blocked; ~most requests resolve in the first three rungs with no browser at all.
+
+### IV.2.2 Discovery
+- Keep **SearXNG** (self-hostable, keyless meta-search) as primary discovery, but **run it as a managed local instance** (Docker) for reliability instead of depending on public instances that rate-limit. Keep **Jina search** (`s.jina.ai`) as a keyless secondary.
+- ➕ Add **sitemap / RSS discovery** for known high-value domains — cheaper and stealthier than search for sites you revisit.
+
+### IV.2.3 Structured-data breadth (the credibility layer — biggest report-quality lever)
+Keep the existing keyless set (World Bank, SEC/EDGAR, OpenAlex, Hacker News, FRED). Consider adding, gated by availability:
+- ➕ **Wikidata / Wikipedia REST** (entities, definitions, baselines) — keyless.
+- ➕ **OpenCorporates / GLEIF LEI** (company identity) — mostly keyless.
+- ➕ **Crossref** (DOIs, publication metadata) — keyless; note this is *not* the excluded semantic_scholar path, same as OpenAlex.
+- ➕ **data.gov / Eurostat / OECD SDMX** (official statistics) — keyless.
+- These are the *cheapest, most reliable, most citable* content on a headless host and are the strongest antidote to "reports look thin." A specialist should query the relevant subset **first**, then use web extraction for color.
+
+### IV.2.4 Rendering / charts
+- ♻ **WeasyPrint** stays the primary PDF path (install + native deps + smoke-test, Part III D15). It is the right headless, no-browser choice.
+- ➕ **Typst** as an *optional* high-end typesetting path for truly "consulting-grade" layout if WeasyPrint's CSS proves limiting — headless, fast, no browser.
+- ♻ **Playwright/Chromium PDF fallback** only when a real Linux browser is provisioned (already the case if nodriver/Patchright are installed for extraction — reuse that Chrome).
+- ♻ **Plotly + kaleido** kept for charts, but pin the static engine (no browser), drop to `scale=2`, and on failure **embed a data table** rather than a missing image (Part III). ➕ Consider **matplotlib** as a zero-dependency chart fallback that never needs a browser.
+
+### IV.2.5 Caching / infra
+- ➕ **SQLite (or DuckDB) as the run store** for the durable journal + response cache + artifact index (IV.1.1) — zero-cost, embedded, no server.
+- ➕ **A managed local SearXNG + (optional) FlareSolverr** via a single `docker-compose` so the "services that must be running" are reproducible instead of assumed.
+
+
+---
+
+## IV.3 — A genuinely more robust STEALTH system (benchmark-grounded)
+
+> This supersedes Part III.4's *conceptual* stealth layers with a **concrete, evidence-backed** stack. The evidence is a 2026 anti-detect benchmark: **7 stealth tools × 31 real targets (Cloudflare/DataDome/Akamai/F5) × 3 sweeps from a residential IP.** The findings overturn some of Part III's tool choices — this is the honest correction.
+
+### IV.3.1 The four detection surfaces (you must defeat the RIGHT one)
+A target can block you at any of four layers. Most tools only address one:
+1. **IP reputation** (datacenter vs residential ASN) — fixed by proxies *only*.
+2. **TLS / JA4 + HTTP/2 SETTINGS fingerprint** — fixed by the HTTPS client shape (curl_cffi / Camoufox), **not** by a proxy.
+3. **JS-runtime fingerprint** (navigator, canvas, WebGL, screen) — fixed by browser-level spoofing (Camoufox/patched Chromium).
+4. **Automation-protocol fingerprint** (the CDP handshake: `Runtime.enable`, `Target.setAutoAttach` sequence Playwright emits) — **this is the layer that hard-blocks headless scrapers, and NO fingerprint patch reaches it.** Only a control plane that is *not Playwright* defeats it.
+
+**Why Part III was incomplete:** FlareSolverr, Obscura `--stealth`, and Playwright-based stealth_search all operate at layers 2–3. The benchmark showed that on the hardest real targets (Cloudflare Turnstile), **every Playwright-based and every fingerprint-patched tool was hard-blocked**, while the tool that drove Chrome *directly over CDP with no Playwright shim* passed with **zero blocked cells**. So the tools Part III named as the stealth answer do not defeat layer 4 — the layer that matters most.
+
+### IV.3.2 Benchmark results that drive the design (31 targets, N=3, residential IP)
+| Tool | Mechanism | OK / Blocked | Verdict for HYPERION |
+|---|---|---|---|
+| **nodriver** | Direct-CDP, no Playwright shim, system Chrome | **28 / 0** | **Primary hard-target extractor.** Only tool with zero blocks; passed Turnstile targets others couldn't. |
+| **curl_cffi** | Chrome-shaped TLS/JA4, HTTP-only (21-line wrapper) | 26 / 2 | **Primary HTTP fetcher.** Matched a 130 MB patched Chromium fork. Use for everything non-JS. |
+| CloakBrowser | Patched Chromium, 49 C++ patches | 26 / 2 | Ties curl_cffi — not worth its weight vs curl_cffi. Skip. |
+| **Camoufox** | Firefox fork, C-level FP spoof, Firefox TLS shape | 25 / 3 | **Secondary browser.** Beats Chromium forks on some Chrome-shape-blocking targets; use as TLS-shape alternative. |
+| Patchright (`channel=chrome`) | Playwright fork, CDP-leak patches + real Chrome | 25 / 3 | Best *drop-in* if already on Playwright; the `channel=chrome` (real Chrome TLS) matters more than the patches. |
+| vanilla Playwright | baseline | 24 / 5 | Do not use for stealth. |
+| rebrowser-playwright | CDP-patch fork, unmaintained | 24 / 5 | Functionally = vanilla. Skip. |
+
+### IV.3.3 The shape-coherence law (the deepest insight — changes HYPERION's host strategy)
+The benchmark proved gates cross-check layers for **consistency**. A **Linux server behind a residential proxy is *worse* than no proxy**, because it manufactures a contradiction: residential IP + Linux-shape TLS/JS fingerprints = obvious mismatch → *harder* block. Consequences for HYPERION (which runs headless on Linux):
+- **You cannot buy your way past layer 4 with a proxy.** For JS-rendered hard targets, the browser must run on a host whose OS-shape matches its fingerprints.
+- **Therefore: prefer the layers you *can* win headless-on-Linux** — layers 2 (curl_cffi Chrome-TLS) and, for JS, nodriver driving a real Linux Chrome (coherent: Linux IP + Linux Chrome shape). Do **not** spoof a macOS/Windows browser from a Linux host — that's an incoherent shape.
+- **Proxies are for layer 1 only**, and only when shape-coherent (residential IP + a browser running on that same residential host, or datacenter IP + honest datacenter behavior). Keep proxy rotation *off by default* (zero-cost) and *coherent* when on.
+
+### IV.3.4 HYPERION's final stealth stack (tiered, cheap-first, shape-coherent)
+```
+Tier 0  Structured JSON APIs .............. no stealth needed (designed for automated access)
+Tier 1  Jina Reader (r.jina.ai) ........... server-side extraction, no fingerprint exposure
+Tier 2  curl_cffi (impersonate=chrome) .... defeats TLS/JA4 layer, headless, ~26/31 targets
+        + Trafilatura for clean main-content parse
+Tier 3  nodriver (system Linux Chrome, .... defeats automation-protocol layer (Turnstile)
+        direct-CDP)                          shape-coherent: Linux IP + Linux Chrome
+Tier 4  Camoufox (Firefox TLS shape) ...... for targets that block Chrome-shape specifically
+Tier 5  FlareSolverr (Cloudflare IUAM) .... optional, health-checked, last resort only
+```
+**Behavioural discipline across ALL tiers (from Part III.4, kept):** per-host token bucket + randomized jitter, request-order shuffling, exponential backoff on 429/403, session/cookie persistence per host, consistent UA *within* a session. **Identity (optional, config-gated):** shape-coherent proxy rotation only.
+
+### IV.3.5 Stealth invariants (final)
+1. **Pick the tool by the detection surface** — never throw a browser at a TLS problem or a proxy at a fingerprint problem.
+2. **Cheap-first escalation** — never open a browser when curl_cffi + Jina Reader answer (most requests).
+3. **Shape-coherence is law** — never present a fingerprint that contradicts the host OS or the IP class. On Linux, be an honest Linux Chrome (nodriver) or an honest HTTP client (curl_cffi).
+4. **Defeat layer 4 with a non-Playwright control plane** (nodriver/direct-CDP) — this is the only thing that passes the hardest gates.
+5. **Loud health, quiet traffic** — blocked/challenged escalates on the ESCALATION channel; traffic stays low-and-slow.
+6. **Proxies are layer-1-only and off by default** — preserve zero-cost; enable only when shape-coherent.
+
+> **Net:** even fully headless on Linux with zero proxies, Tiers 0–2 (APIs + Jina + curl_cffi/Trafilatura) resolve the large majority of real targets, and Tier 3 (nodriver on a local Linux Chrome) adds the hard Cloudflare-Turnstile targets that *nothing in Part III's named toolset could reach*. That is a materially more robust stealth system than "FlareSolverr + Obscura --stealth."
+
+
+---
+
+## IV.4 — Upgraded roadmap (P10–P13) & maturity scorecard
+
+> Parts I–III delivered P1–P9 (fix + robustness). These phases take HYPERION from "reliable" (Level 2) to "best-in-class" (Level 4). They are **additive and optional-in-order**: ship P1–P9 first (the system must *work*), then layer these to make it *best-in-class*.
+
+### P10 — DURABILITY (Level 2 → 3)
+1. `RunJournal` (SQLite, append-only) + content-addressed artifact store (IV.1.1).
+2. Every DAG node = idempotent step with `inputs_hash` cache lookup before execution.
+3. Orchestrator replay/resume by `run_id`; blackboard-based HANDOFF (IV.1.2).
+4. `run_manifest.json` with seed + pinned prompt/model versions (IV.1.4).
+**Exit:** kill the process at minute N of a run → restart with same `run_id` resumes from step N; no completed extraction/finding/section is recomputed.
+
+### P11 — MEASURABLE QUALITY (Level 3, the quality bar)
+1. Golden-set of representative queries across all workflow types (IV.1.3).
+2. Deterministic report checks + LLM-as-judge rubric (shared with runtime gate).
+3. CI regression gate on golden-set mean score.
+**Exit:** CI fails on a prompt/model change that drops golden-set quality > threshold; every release has a quality number.
+
+### P12 — SOTA EXTRACTION + STEALTH (robustness ceiling)
+1. curl_cffi as default fetcher + Trafilatura parse layer (IV.2.1).
+2. nodriver (system Linux Chrome, direct-CDP) as the hard-target extractor; Camoufox secondary (IV.3.4).
+3. Tiered cheap-first extraction ladder + shape-coherence discipline + behavioural token-bucket/jitter (IV.3).
+4. Managed local SearXNG (+optional FlareSolverr) via docker-compose (IV.2.5).
+**Exit:** on a headless Linux host with zero proxies, ≥90% of a target sample yields clean main-content text; Cloudflare-Turnstile targets resolve via nodriver; no incoherent-shape requests are emitted.
+
+### P13 — EFFICIENCY + SELF-IMPROVEMENT (Level 4)
+1. Semantic + exact response cache (IV.1.5) wired to the durable step cache.
+2. Speculative provider racing for critical-path DEEP calls (IV.1.5).
+3. Structured-output validation-and-repair loop (IV.1.5).
+4. Metrics + distributed trace + per-run cost/latency ledger + completion health table (IV.1.6).
+**Exit:** cache-hit rate reported per run; DEEP-call p95 latency drops materially; a dashboard/health table shows tool/tier/cost/degraded status for every run.
+
+### IV.4.1 Maturity scorecard (target end-state)
+| Level | Name | Reached by |
+|---|---|---|
+| 1 | **Broken** | (starting point — empty/garbage reports, designer never runs) |
+| 2 | **Reliable** | P1–P9 (Parts I–III): works, never-None, graceful degradation |
+| 3 | **Durable & Measurable** | P10–P12: crash-resume, measurable quality, SOTA extraction/stealth |
+| 4 | **Best-in-class** | P13: cached, fast, self-observing, regression-gated |
+
+### IV.4.2 Direct answers to the user's four questions
+1. **"Is this the best, most robust production-grade architecture?"** — After Parts I–III: **no — it's *reliable* (Level 2), not best-in-class.** The honest gaps are durability, measurable quality, and stealth-tool correctness.
+2. **"Can we improve it?"** — **Yes, materially**, via P10–P13: durable execution, an offline eval harness, and reproducible/replayable runs move it to Level 4.
+3. **"Better tools?"** — **Yes:** add **Trafilatura** (parse), make **curl_cffi** the default fetcher, add **nodriver/Camoufox** for hard targets, broaden **structured-data APIs**, and use **SQLite** for the durable store. Demote Obscura/FlareSolverr to optional.
+4. **"More robust stealth system?"** — **Yes, and this is the biggest correction:** Part III named tools (FlareSolverr/Obscura/Playwright-stealth) that do **not** defeat *automation-protocol fingerprinting* — the layer that actually hard-blocks you. The benchmark-grounded stack (curl_cffi TLS + **nodriver direct-CDP** + Camoufox + **shape-coherence law**) is materially more robust and works headless-on-Linux at zero cost.
+
+### IV.4.3 Constraints reaffirmed (proprietary, multi-workflow)
+- Every recommendation is a **general-purpose invariant**, not tailored to any one example query.
+- **reddit and semantic/academic (semantic_scholar) remain deliberately excluded**; OpenAlex/Crossref (distinct, allowed) may be used.
+- Zero-cost posture preserved: every added tool (Trafilatura, curl_cffi, nodriver, Camoufox, SQLite, SearXNG, WeasyPrint/Typst) is free and headless-capable; proxies stay off by default.
+
+*End of PART IV. — After Parts I–IV, HYPERION has: a verified root-cause diagnosis (I), implementation-grade fixes (II), a per-level forensic audit (III), and an evidence-backed path from reliable to best-in-class (IV).*
+
