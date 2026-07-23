@@ -947,9 +947,9 @@ class PresentationDesigner(BaseAgent):
         self._cover_image: ImageSelection | None = None
         self._section_images: dict[str, ImageSelection] = {}
 
-        # L5.17: track already-used Unsplash image IDs so no image is ever
-        # reused across the cover and section headers (the "same image every
-        # time" failure). Picking prefers the first unused candidate.
+        # Track already-used Unsplash image IDs so no image is ever reused across
+        # the cover and section headers (the "same image every time" failure).
+        # Picking prefers the first unused candidate.
         self._used_image_ids: set[str] = set()
 
         # Chart placements

@@ -31,6 +31,21 @@ doi_resolvers:
   doi.org: "https://doi.org/"
   sci-hub.se: "https://sci-hub.se/"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DOI resolvers — REQUIRED when use_default_settings: false.
+# SearXNG's preferences layer reads `default_doi_resolver` unconditionally on
+# every /search request (searx/preferences.py). Because we disable default
+# settings, these keys are NOT auto-supplied, so their absence raises
+# `KeyError: 'default_doi_resolver'` → HTTP 500 on EVERY search. Supplying them
+# here is what keeps the search endpoint alive.
+# ─────────────────────────────────────────────────────────────────────────────
+default_doi_resolver: "oadoi.org"
+doi_resolvers:
+  oadoi.org: "https://oadoi.org/"
+  doi.org: "https://doi.org/"
+  doai.io: "https://dissem.in/"
+  sci-hub.se: "https://sci-hub.se/"
+
 server:
   secret_key: "hyperion-searxng-secret-change-me"
   bind_address: "0.0.0.0"

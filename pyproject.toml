@@ -35,6 +35,7 @@ dependencies = [
     "kaleido>=0.2.1,<1.0",  # D26: pin to static engine (v1.x needs Chrome)
     "matplotlib>=3.8.0",  # D26: chart fallback when kaleido fails
     "pillow>=10.4.0",
+    "pymupdf>=1.24.0",  # fitz: PDF page-count + blank-page + font-embed verification
 
     # TUI — Textual + Rich + Typer
     "textual>=0.70.0",
