@@ -712,8 +712,29 @@ class PDFRenderer:
 
             return result
 
-        # Both methods failed
-        result.error = f"WeasyPrint: {weasy_error!s:.80}; Playwright fallback also failed"
+        # ── Both methods failed: HARD FAIL ──
+        # Never leave a misleading, deliverable-looking HTML file behind. The
+        # ..._playwright.html / .html scratch files are debug artifacts, NOT the
+        # report. Shipping them is exactly why past output "looked like a website
+        # instead of a PDF". Remove them and fail explicitly so upstream cannot
+        # mistake a scratch file for the deliverable.
+        result.success = False
+        result.pdf_path = ""
+        for scratch in (
+            output_path.replace(".pdf", "_playwright.html"),
+            html_path,
+        ):
+            try:
+                if os.path.exists(scratch):
+                    os.remove(scratch)
+            except OSError:
+                pass
+        result.html_path = ""
+        result.error = (
+            f"PDF generation FAILED — WeasyPrint: {weasy_error!s:.80}; "
+            f"Playwright fallback also failed. No deliverable produced "
+            f"(debug HTML removed to avoid shipping a non-PDF artifact)."
+        )
         return result
 
     def render_from_template(
