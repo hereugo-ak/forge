@@ -106,7 +106,8 @@ UNSHARP_THRESHOLD = 3
 # Required fonts to embed (§7.4)
 REQUIRED_FONTS = [
     "Instrument Serif",
-    "JetBrains Mono",
+    "Source Sans 3",  # D24: body font changed from JetBrains Mono
+    "JetBrains Mono",  # Still required for tables/numbers
 ]
 
 # PDF output directory
@@ -378,7 +379,7 @@ class RenderEngine(BaseAgent):
         HYPERION brand palette. (§6.4)
         """
         try:
-            from PIL import ImageEnhance, ImageOps
+            from PIL import Image, ImageEnhance, ImageOps
 
             # Split into RGB channels
             r, g, b = img.split()
@@ -546,7 +547,8 @@ class RenderEngine(BaseAgent):
                     )
                 processed[img_path] = processed_path
             except ImageTooSmallError as e:
-                self._verification_issues.append(f"Image too small: {e}")
+                # D25: Non-fatal — skip image, don't add to verification issues
+                # The report should still render without this photo
                 processed[img_path] = img_path  # Use original as fallback
 
         # Process chart images
@@ -560,7 +562,7 @@ class RenderEngine(BaseAgent):
                 )
                 processed[chart_path] = processed_path
             except ImageTooSmallError as e:
-                self._verification_issues.append(f"Chart image too small: {e}")
+                # D25: Non-fatal — skip chart image processing
                 processed[chart_path] = chart_path
 
         self._processed_images = processed
@@ -614,10 +616,12 @@ class RenderEngine(BaseAgent):
             try:
                 with open(html_path, "r", encoding="utf-8") as f:
                     html_content = f.read()
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
+                self._log(f"RENDER: failed to read HTML file: {e!s:.200}")
                 return ""
 
             if not html_content:
+                self._log("RENDER: HTML content is empty")
                 return ""
 
             result = weasyprint_tool.render_pdf(
@@ -626,11 +630,20 @@ class RenderEngine(BaseAgent):
             )
 
             if result and result.success:
+                if result.warnings:
+                    self._log(f"RENDER: PDF generated with warnings: {'; '.join(result.warnings[:3])}")
                 return self._pdf_path
             else:
+                error_msg = ""
+                if result and result.error:
+                    error_msg = result.error[:200]
+                elif result and result.warnings:
+                    error_msg = "; ".join(result.warnings[:3])
+                self._log(f"RENDER: PDFRenderer failed: {error_msg}")
                 return ""
 
-        except (ValueError, AttributeError, RuntimeError):
+        except (ValueError, AttributeError, RuntimeError) as e:
+            self._log(f"RENDER: WeasyPrint tool unavailable ({type(e).__name__}: {e!s:.100}), trying direct import")
             # Fallback: try direct weasyprint import
             try:
                 from weasyprint import HTML
@@ -640,7 +653,8 @@ class RenderEngine(BaseAgent):
                     dpi=300,
                 )
                 return self._pdf_path
-            except (ImportError, RuntimeError, OSError):
+            except (ImportError, RuntimeError, OSError) as e2:
+                self._log(f"RENDER: Direct WeasyPrint also failed: {type(e2).__name__}: {e2!s:.200}")
                 return ""
 
     # ─────────────────────────────────────────────────────────────────────

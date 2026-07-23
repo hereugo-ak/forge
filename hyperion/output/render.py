@@ -123,6 +123,7 @@ class TemplateRenderer:
             self._env.filters["format_date"] = self._format_date
             self._env.filters["truncate_chars"] = self._truncate_chars
             self._env.filters["md_to_html"] = self._markdown_to_html
+            self._env.filters["clean_dict_repr"] = self._clean_dict_repr
 
         return self._env
 
@@ -163,21 +164,67 @@ class TemplateRenderer:
             return value
         return value[:length - 3] + "..."
 
+    def _clean_dict_repr(self, value: Any) -> str:
+        """Clean up raw dict/list reprs that leak into report text.
+
+        When the synthesis lead or specialist agents put a Pydantic model's
+        repr() or a dict's str() into a text field, it shows up in the report
+        as ``{'recommendation': 'BUY', 'time_to_market_build': 'Unknown', ...}``.
+        This filter extracts readable key-value pairs from such strings and
+        formats them as ``Key: Value`` lines. If the value is already clean
+        text, it passes through unchanged.
+        """
+        import re as _re
+        if value is None:
+            return ""
+        text = str(value)
+        # Detect dict repr pattern: starts with { and contains 'key': 'value'
+        if text.strip().startswith("{") and "'" in text:
+            # Try to parse as JSON-like dict string
+            try:
+                # Replace single quotes with double quotes for JSON parsing
+                json_str = text.replace("'", '"')
+                import json as _json
+                data = _json.loads(json_str)
+                lines = []
+                for k, v in data.items():
+                    # Make key readable: replace underscores with spaces, title case
+                    readable_key = k.replace("_", " ").title()
+                    lines.append(f"{readable_key}: {v}")
+                return " · ".join(lines)
+            except (ValueError, TypeError):
+                pass
+            # Fallback: regex extract key-value pairs
+            pairs = _re.findall(r"'([\w_]+)':\s*'([^']*)'", text)
+            if pairs:
+                lines = []
+                for k, v in pairs:
+                    readable_key = k.replace("_", " ").title()
+                    lines.append(f"{readable_key}: {v}")
+                return " · ".join(lines)
+            # If we can't extract pairs, just truncate the raw repr
+            if len(text) > 200:
+                return text[:197] + "..."
+        return text
+
     def _markdown_to_html(self, value: str) -> str:
         """Convert basic markdown to HTML for report rendering.
 
         Handles: **bold**, *italic*, ## headings, ### sub-headings,
         - bullet lists, and paragraph breaks. Lightweight — no external deps.
 
-        Returns a jinja2.Markup object so Jinja2 does NOT re-escape the output.
+        Returns a markupsafe.Markup object so Jinja2 does NOT re-escape the output.
         """
         if not value:
             return ""
 
         try:
-            from jinja2 import Markup
+            from markupsafe import Markup
         except ImportError:
-            Markup = str  # fallback — str will be auto-escaped by Jinja2
+            try:
+                from jinja2 import Markup  # deprecated fallback for old jinja2
+            except ImportError:
+                Markup = str  # fallback — str will be auto-escaped by Jinja2
 
         import re
 
@@ -195,9 +242,13 @@ class TemplateRenderer:
         lines = html.split("\n")
         result: list[str] = []
         in_list = False
+        in_paragraph = False
         for line in lines:
             stripped = line.strip()
             if stripped.startswith("- "):
+                if in_paragraph:
+                    result.append("</p>")
+                    in_paragraph = False
                 if not in_list:
                     result.append("<ul>")
                     in_list = True
@@ -207,16 +258,26 @@ class TemplateRenderer:
                     result.append("</ul>")
                     in_list = False
                 if stripped and not stripped.startswith("<h"):
-                    # Wrap non-heading, non-empty lines in <p> tags
-                    if not result or not result[-1].startswith("<p>"):
-                        result.append(f"<p>{stripped}</p>")
+                    # Empty line breaks the current paragraph
+                    if not in_paragraph:
+                        result.append(f"<p>{stripped}")
+                        in_paragraph = True
                     else:
-                        # Append to previous paragraph
-                        result[-1] = result[-1][:-4] + " " + stripped + "</p>"
+                        result.append(stripped)
                 elif stripped.startswith("<h"):
+                    if in_paragraph:
+                        result.append("</p>")
+                        in_paragraph = False
                     result.append(stripped)
+                else:
+                    # Empty line — close current paragraph
+                    if in_paragraph:
+                        result.append("</p>")
+                        in_paragraph = False
         if in_list:
             result.append("</ul>")
+        if in_paragraph:
+            result.append("</p>")
 
         output = "\n".join(result)
         if Markup is not str:
@@ -371,30 +432,156 @@ class PDFRenderer:
             from playwright.sync_api import sync_playwright
 
             # Write HTML to a temp file so Playwright can load it
-            import tempfile
             temp_html = output_path.replace(".pdf", "_playwright.html")
             full_html = html
-            if css_content:
+            # Only prepend CSS if the HTML doesn't already have inline <style>
+            if css_content and "<style>" not in html[:500]:
                 full_html = f"<style>{css_content}</style>" + html
             with open(temp_html, "w", encoding="utf-8") as f:
                 f.write(full_html)
 
+            # Build proper file:// URL for Windows (C:\path → file:///C:/path)
+            file_url = f"file:///{temp_html.replace(os.sep, '/').lstrip('/')}"
+
             with sync_playwright() as p:
                 browser = p.chromium.launch()
                 page = browser.new_page()
-                page.goto(f"file:///{temp_html.replace(os.sep, '/')}")
+                page.goto(file_url, wait_until="networkidle")
                 page.pdf(
                     path=output_path,
                     format="A4",
                     print_background=True,
-                    margin={"top": "25mm", "bottom": "25mm", "left": "25mm", "right": "25mm"},
+                    margin={
+                        "top": "25mm",
+                        "bottom": "25mm",
+                        "left": "40mm",
+                        "right": "25mm",
+                    },
+                    prefer_css_page_size=True,
                 )
                 browser.close()
 
-            return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            success = os.path.exists(output_path) and os.path.getsize(output_path) > 0
+            if not success:
+                print("[RENDER] Playwright: PDF file missing or empty after render")
+            return success
 
-        except Exception:
+        except ImportError:
+            print("[RENDER] Playwright not installed — cannot use PDF fallback")
             return False
+        except Exception as exc:
+            print(f"[RENDER] Playwright PDF fallback failed: {type(exc).__name__}: {exc!s:.200}")
+            return False
+
+    def _embed_images_as_data_uris(self, html: str) -> str:
+        """Convert img src file paths to base64 data URIs (D17 fix).
+
+        WeasyPrint and Playwright can't reliably load images from absolute
+        Windows paths (C:\\...) or relative paths. Embedding as data URIs
+        makes the HTML self-contained — no external file dependencies.
+
+        Handles:
+        - <img src="C:\\path\\to\\image.png">  → <img src="data:image/png;base64,...">
+        - <img src="path/to/image.png">       → resolved relative to cwd
+        - <img src="data:image/...">          → already embedded, skip
+        - <img src="https://...">             → remote URL, skip
+        """
+        import re
+        import base64
+
+        # Match img src attributes
+        img_pattern = re.compile(r'<img\s+[^>]*src="([^"]+)"', re.IGNORECASE)
+
+        def replace_src(match: re.Match[str]) -> str:
+            src = match.group(1)
+
+            # Skip already-embedded data URIs
+            if src.startswith("data:"):
+                return match.group(0)
+
+            # Skip remote URLs
+            if src.startswith("http://") or src.startswith("https://"):
+                return match.group(0)
+
+            # Resolve to absolute path
+            img_path = Path(src)
+            if not img_path.is_absolute():
+                img_path = Path.cwd() / img_path
+
+            if not img_path.exists():
+                return match.group(0)  # Leave as-is if file doesn't exist
+
+            # Determine MIME type
+            ext = img_path.suffix.lower()
+            mime_map = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".svg": "image/svg+xml",
+                ".webp": "image/webp",
+                ".bmp": "image/bmp",
+            }
+            mime_type = mime_map.get(ext, "application/octet-stream")
+
+            # Read and encode
+            try:
+                img_data = img_path.read_bytes()
+                b64 = base64.b64encode(img_data).decode("ascii")
+                new_src = f"data:{mime_type};base64,{b64}"
+                return match.group(0).replace(src, new_src)
+            except (OSError, ValueError):
+                return match.group(0)
+
+        return img_pattern.sub(replace_src, html)
+
+    def _embed_fonts_in_css(self, css_content: str) -> str:
+        """Convert @font-face src url() to base64 data URIs in CSS (D17 fix).
+
+        Ensures fonts are embedded when using the Playwright fallback,
+        which doesn't resolve relative url() references in CSS.
+        """
+        import re
+        import base64
+
+        # Match url("...") inside @font-face src declarations
+        url_pattern = re.compile(r'url\("([^"]+)"\)', re.IGNORECASE)
+
+        def replace_url(match: re.Match[str]) -> str:
+            url = match.group(1)
+
+            # Skip data URIs and remote URLs
+            if url.startswith("data:") or url.startswith("http"):
+                return match.group(0)
+
+            # Resolve relative to the CSS file location
+            font_path = self.CSS_PATH.parent / url
+            if not font_path.exists():
+                # Try relative to cwd
+                font_path = Path(url)
+                if not font_path.is_absolute():
+                    font_path = Path.cwd() / font_path
+
+            if not font_path.exists():
+                return match.group(0)
+
+            ext = font_path.suffix.lower()
+            mime_map = {
+                ".ttf": "font/ttf",
+                ".otf": "font/otf",
+                ".woff": "font/woff",
+                ".woff2": "font/woff2",
+            }
+            mime_type = mime_map.get(ext, "application/octet-stream")
+
+            try:
+                font_data = font_path.read_bytes()
+                b64 = base64.b64encode(font_data).decode("ascii")
+                return f'url("data:{mime_type};base64,{b64}")'
+            except (OSError, ValueError):
+                return match.group(0)
+
+        return url_pattern.sub(replace_url, css_content)
 
     def render_pdf(
         self,
@@ -432,10 +619,16 @@ class PDFRenderer:
         if additional_css:
             css_content += "\n" + additional_css
 
+        # D17: Embed fonts as data URIs for Playwright fallback compatibility
+        css_embedded = self._embed_fonts_in_css(css_content)
+
         # Combine cover + body if cover is provided
         full_html = html
         if cover_html:
             full_html = cover_html + '<div class="page-break"></div>' + html
+
+        # D17: Embed images as base64 data URIs so HTML is self-contained
+        full_html = self._embed_images_as_data_uris(full_html)
 
         # Save HTML for debugging
         html_path = output_path.replace(".pdf", ".html")
@@ -489,7 +682,7 @@ class PDFRenderer:
             result.warnings.append(f"WeasyPrint failed: {weasy_error!s:.120}")
 
         # ── Attempt 2: Playwright Chromium fallback ──
-        if self._render_pdf_playwright(full_html, output_path, css_content):
+        if self._render_pdf_playwright(full_html, output_path, css_embedded):
             result.pdf_path = output_path
             result.success = True
             result.file_size_bytes = os.path.getsize(output_path)

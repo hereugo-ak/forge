@@ -331,7 +331,7 @@ class RiskAnalysis(BaseModel):
     top_risks: list[Risk] = Field(default_factory=list, description="Top 10 risks with mitigations")
     black_swan_scenarios: list[Risk] = Field(default_factory=list, description="Low-probability, high-impact events")
     residual_risk_summary: str = Field(description="Risk profile after mitigations")
-    scenario_plan: dict[str, str] = Field(default_factory=dict, description="best/base/worst with triggers")
+    scenario_plan: dict[str, Any] = Field(default_factory=dict, description="best/base/worst with triggers")
     confidence: ConfidenceLevel
     sources: list[Source] = Field(default_factory=list)
 
@@ -2013,7 +2013,7 @@ class LayoutPlan(BaseModel):
     typography: dict[str, str] = Field(
         default_factory=lambda: {
             "header_font": "Instrument Serif",
-            "body_font": "JetBrains Mono",
+            "body_font": "Source Sans 3",  # D24: professional sans
             "cover_title_size": "36pt",
             "section_header_size": "22pt",
             "subsection_header_size": "14pt",

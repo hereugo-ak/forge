@@ -1082,13 +1082,30 @@ class RiskAnalyst(BaseAgent):
         )
 
         if not risks:
-            await self._transition(
-                AgentState.BLOCKED,
-                "No risks identified — cannot proceed with risk analysis",
+            await self._escalate(
+                issue="No risks identified from available sources — publishing gap finding",
+                suggested_action="Proceed with degraded analysis; flag data gap in report",
             )
+            gap_finding = KeyFinding(
+                id=f"finding_{uuid.uuid4().hex[:8]}",
+                agent=self.name.value,
+                finding_type="risk_gap",
+                title="Risk analysis gap — insufficient source data",
+                content=(
+                    f"No specific risks could be identified for the question: "
+                    f"'{self._question[:120]}'. This is a data-availability gap, "
+                    f"not an absence of risk. Sources checked: {len(self._sources)}."
+                ),
+                confidence=ConfidenceLevel.LOW,
+                sources=self._sources[:3],
+            )
+            await self._publish_finding(gap_finding)
             return RiskAnalysis(
                 risks=[],
-                residual_risk_summary="No risks identified — analysis incomplete",
+                residual_risk_summary=(
+                    "Risk analysis incomplete — insufficient source data to identify "
+                    "specific risks. This gap is flagged in findings."
+                ),
                 confidence=ConfidenceLevel.LOW,
                 sources=self._sources,
             )

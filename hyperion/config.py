@@ -150,6 +150,7 @@ GOOGLE_MODELS: list[ModelSpec] = [
         rpd=20,
         tier=ModelTier.DEEP,
         roles=["reserve"],
+        deprecated=True,  # D19: rpd=20 is too low for useful DEEP capacity
     ),
     ModelSpec(
         name="gemini-3-flash",
@@ -160,6 +161,7 @@ GOOGLE_MODELS: list[ModelSpec] = [
         rpd=20,
         tier=ModelTier.DEEP,
         roles=["reserve"],
+        deprecated=True,  # D19: rpd=20 is too low for useful DEEP capacity
     ),
 ]
 
@@ -270,6 +272,18 @@ GROQ_MODELS: list[ModelSpec] = [
         tpd=500_000,
         tier=ModelTier.MICRO,
         roles=["micro backup", "14.4K RPD"],
+    ),
+    # D20: Add a Groq FAST model for secondary FAST capacity
+    ModelSpec(
+        name="llama-3.1-8b-instant",
+        provider=ProviderType.GROQ,
+        context_window=128_000,
+        rpm=30,
+        tpm=30_000,
+        rpd=14_400,
+        tpd=500_000,
+        tier=ModelTier.FAST,
+        roles=["fast secondary", "sub-agent research", "keyword matching"],
     ),
     ModelSpec(
         name="llama-4-scout-17b",
@@ -444,8 +458,12 @@ class QualityGateConfig(BaseModel):
     # Minimum score to approve (1-5 scale, §4.5)
     threshold: float = 4.0
 
-    # Max iterations before escalation (§4.5)
-    max_iterations: int = 3
+    # Max iterations before escalation (§4.5) — capped at 2 (P7 content-aware gate)
+    max_iterations: int = 2
+
+    # Source-count floor — if the report has fewer sources than this, stop
+    # iterating because more passes won't fix thin evidence (P7 content-aware gate)
+    source_count_floor: int = 3
 
     # Minimum per-dimension score — if any dimension scores below this,
     # the report goes back regardless of total score (§6.5)
@@ -670,7 +688,8 @@ class Settings(BaseSettings):
 
     # ── Quality Gate ──
     quality_threshold: float = 4.0
-    max_quality_iterations: int = 3
+    max_quality_iterations: int = 2  # P7: capped at ≤2 (was 3)
+    quality_source_floor: int = 3   # P7: stop iterating if sources < floor
 
     # ── Sub-Agent ──
     sub_agent_timeout: int = 300
@@ -685,9 +704,10 @@ class Settings(BaseSettings):
     # ── Engagement ──
     max_engagement_duration: int = 900
 
-    # ── Logging ──
-    log_level: str = "INFO"
-    debug_router: bool = False
+    # ── Stealth Layer 3 (P8 GAP-3): proxy/UA rotation, off by default ──
+    stealth_proxy_enabled: bool = False
+    stealth_proxy_url: str = ""  # e.g. "http://user:pass@proxy:8080"
+    stealth_ua_rotation: bool = False  # rotate UA per request when True
 
     # ── Tool Paths ──
     searxng_url: str = "http://localhost:8888"

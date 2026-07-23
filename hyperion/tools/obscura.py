@@ -64,14 +64,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -181,11 +185,11 @@ class ObscuraClient:
         self._cdp_port: int = self.DEFAULT_PORT
         self._command_id: int = 0
         self._stealth: bool = True
+        # P12 GAP-5: Managed `obscura serve` subprocess
+        self._serve_proc: asyncio.subprocess.Process | None = None
 
     def _find_obscura(self) -> str:
         """Find the obscura binary."""
-        import sys
-
         # Check configured path first
         if self._obscura_path and os.path.exists(self._obscura_path):
             return self._obscura_path
@@ -212,6 +216,54 @@ class ObscuraClient:
 
         return self._obscura_path  # Return configured path even if not found
 
+    def _is_platform_supported(self) -> bool:
+        """Check if Obscura binary is supported on this platform.
+
+        Obscura is distributed as a Windows binary (.exe). On non-Windows
+        platforms, it won't run even if the file exists in the project.
+        This guard prevents subprocess errors and lets the extraction
+        fallback chain proceed to the next tool.
+        """
+        # Windows: always supported (binary is .exe)
+        if sys.platform == "win32":
+            return True
+
+        # Non-Windows: check if a platform-native binary exists in PATH
+        # (user may have compiled from source for Linux/macOS)
+        found = shutil.which("obscura")
+        if found:
+            return True
+
+        # Check if the local obscura-bin has a non-.exe binary
+        project_root = Path(__file__).resolve().parents[2]
+        native_binary = project_root / "obscura-bin" / "obscura"
+        if native_binary.exists() and sys.platform != "win32":
+            # Verify it's actually executable (not the Windows .exe renamed)
+            try:
+                result = subprocess.run(
+                    [str(native_binary), "--version"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    return True
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+        logger.debug(
+            "Obscura binary not available on platform %s — skipping, "
+            "extraction fallback chain will use next tool",
+            sys.platform,
+        )
+        return False
+
+    def _binary_available(self) -> bool:
+        """Check if the Obscura binary exists and is platform-supported."""
+        if not self._is_platform_supported():
+            return False
+        obscura_bin = self._find_obscura()
+        return bool(obscura_bin) and os.path.exists(obscura_bin)
+
     # ─────────────────────────────────────────────────────────────────────
     # CLI Commands — one-shot operations
     # ─────────────────────────────────────────────────────────────────────
@@ -232,6 +284,13 @@ class ObscuraClient:
         Returns:
             ObscuraFetchResult with the rendered page content.
         """
+        # Platform guard — skip gracefully if binary not available
+        if not self._binary_available():
+            return ObscuraFetchResult(
+                url=url,
+                error=f"Obscura binary not available on {sys.platform}",
+            )
+
         obscura_bin = self._find_obscura()
 
         cmd = [obscura_bin, "fetch", url, "--dump", output_format]
@@ -314,6 +373,17 @@ class ObscuraClient:
         if isinstance(urls, str):
             urls = [urls]
 
+        # Platform guard — skip gracefully if binary not available
+        if not self._binary_available():
+            return ObscuraScrapeResult(
+                results=[ObscuraFetchResult(
+                    url=u,
+                    error=f"Obscura binary not available on {sys.platform}",
+                ) for u in urls],
+                total=len(urls),
+                failed=len(urls),
+            )
+
         obscura_bin = self._find_obscura()
 
         cmd = [obscura_bin, "scrape"] + urls
@@ -390,11 +460,103 @@ class ObscuraClient:
             )
 
     # ─────────────────────────────────────────────────────────────────────
+    # P12 GAP-5: Managed `obscura serve` subprocess
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def start_serve(self, port: int = DEFAULT_PORT) -> bool:
+        """Start `obscura serve` as a managed subprocess.
+
+        Spawns the Obscura CDP server in the background and waits for it
+        to become ready.  The process is tracked and cleaned up by
+        stop_serve() or close().
+
+        Args:
+            port: CDP WebSocket port (default 9222)
+
+        Returns:
+            True if the server started successfully, False otherwise.
+        """
+        if self._serve_proc and self._serve_proc.returncode is None:
+            # Already running
+            return True
+
+        if not self._binary_available():
+            logger.debug("Obscura serve: binary not available on %s", sys.platform)
+            return False
+
+        obscura_bin = self._find_obscura()
+        cmd = [obscura_bin, "serve", "--port", str(port)]
+        if self._stealth:
+            cmd.append("--stealth")
+
+        try:
+            self._serve_proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            logger.info("Obscura serve started (pid=%d, port=%d)", self._serve_proc.pid, port)
+
+            # Wait for the server to become ready
+            if await self._wait_for_serve(port):
+                self._cdp_port = port
+                return True
+            else:
+                logger.warning("Obscura serve did not become ready within timeout")
+                await self.stop_serve()
+                return False
+
+        except (OSError, FileNotFoundError) as e:
+            logger.warning("Obscura serve failed to start: %s", e)
+            self._serve_proc = None
+            return False
+
+    async def _wait_for_serve(self, port: int, timeout: float = 10.0) -> bool:
+        """Wait for the Obscura serve HTTP endpoint to respond."""
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(f"http://localhost:{port}/json/version")
+                    if resp.status_code == 200:
+                        return True
+            except (httpx.HTTPError, httpx.RequestError):
+                pass
+            await asyncio.sleep(0.5)
+        return False
+
+    async def stop_serve(self) -> None:
+        """Stop the managed `obscura serve` subprocess."""
+        if self._serve_proc and self._serve_proc.returncode is None:
+            try:
+                self._serve_proc.terminate()
+                await asyncio.wait_for(self._serve_proc.wait(), timeout=5.0)
+                logger.info("Obscura serve stopped (pid=%d)", self._serve_proc.pid)
+            except asyncio.TimeoutError:
+                self._serve_proc.kill()
+                logger.warning("Obscura serve killed (did not terminate gracefully)")
+            except (OSError, ProcessLookupError):
+                pass
+        self._serve_proc = None
+
+    def _is_serve_running(self) -> bool:
+        """Check if the managed serve process is still alive."""
+        return (
+            self._serve_proc is not None
+            and self._serve_proc.returncode is None
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
     # CDP WebSocket — multi-step interactive browser session
     # ─────────────────────────────────────────────────────────────────────
 
     async def connect_cdp(self, port: int = DEFAULT_PORT) -> bool:
         """Connect to an Obscura CDP WebSocket server.
+
+        P12 GAP-5: If no server is running on the specified port, this
+        method will auto-start `obscura serve` as a managed subprocess
+        before connecting.
 
         Requires `obscura serve --port <port> --stealth` to be running.
 
@@ -404,7 +566,21 @@ class ObscuraClient:
         Returns:
             True if connection succeeded, False otherwise.
         """
+        # Platform guard — skip if binary not available
+        if not self._binary_available():
+            logger.debug("Obscura CDP not available on %s — skipping", sys.platform)
+            return False
+
         self._cdp_port = port
+
+        # P12 GAP-5: Auto-start managed serve process if not already running
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                await client.get(f"http://localhost:{port}/json/version")
+        except (httpx.HTTPError, httpx.RequestError):
+            # Server not running — try to start it
+            if not await self.start_serve(port):
+                return False
 
         try:
             # Get the WebSocket endpoint from the CDP HTTP API
@@ -662,8 +838,9 @@ class ObscuraClient:
             self._cdp_client = None
 
     async def close(self) -> None:
-        """Close all connections."""
+        """Close all connections and stop managed serve process."""
         await self.close_browser()
+        await self.stop_serve()
 
     async def __aenter__(self) -> ObscuraClient:
         return self

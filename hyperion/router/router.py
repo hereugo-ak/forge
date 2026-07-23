@@ -51,7 +51,11 @@ from hyperion.router.providers.google import GoogleProvider
 from hyperion.router.providers.groq import GroqProvider
 from hyperion.router.providers.mistral import MistralProvider
 from hyperion.router.providers.nvidia import NvidiaProvider
+from hyperion.router.semantic_cache import ResponseCache
+from hyperion.router.speculative_racer import SpeculativeRacer
+from hyperion.router.structured_validator import StructuredValidator
 from hyperion.router.wait_gate import ProviderCandidate, SlidingWindowTracker, WaitGate
+from hyperion.obs import trace
 
 
 # Tier adjacency for fallback (§3.3: "> 30s wait: try adjacent tier")
@@ -62,6 +66,27 @@ _TIER_ADJACENCY: dict[ModelTier, list[ModelTier]] = {
     ModelTier.STANDARD: [ModelTier.STRONG, ModelTier.FAST],
     ModelTier.STRONG: [ModelTier.DEEP, ModelTier.STANDARD],
     ModelTier.DEEP: [ModelTier.STRONG],
+}
+
+# D9: Explicit tier downgrade — when ALL providers in a tier fail, degrade
+# to the next lower tier rather than giving up.
+_TIER_DOWNGRADE: dict[ModelTier, ModelTier] = {
+    ModelTier.DEEP: ModelTier.STRONG,
+    ModelTier.STRONG: ModelTier.STANDARD,
+}
+
+# D19/D20/D21: Provider priority per tier — controls which provider is tried
+# first within a tier. Providers not listed are appended in arbitrary order.
+# Rationale:
+#   FAST: Mistral primary (rpm60), Groq secondary (rpm30), Cerebras overflow (rpm5)
+#   STANDARD: NVIDIA/Mistral primary (high TPM), Groq burst-only (tpm8k)
+#   DEEP: Google flash-lite, Mistral devstral, NVIDIA ultra-550b (round-robin, ≥2 non-Google)
+#   STRONG: NVIDIA nemotron, Mistral large
+_TIER_PROVIDER_PRIORITY: dict[ModelTier, list[ProviderType]] = {
+    ModelTier.FAST: [ProviderType.MISTRAL, ProviderType.GROQ, ProviderType.CEREBRAS],
+    ModelTier.STANDARD: [ProviderType.NVIDIA, ProviderType.MISTRAL, ProviderType.GROQ],
+    ModelTier.DEEP: [ProviderType.MISTRAL, ProviderType.NVIDIA, ProviderType.GOOGLE],
+    ModelTier.STRONG: [ProviderType.NVIDIA, ProviderType.MISTRAL],
 }
 
 
@@ -116,6 +141,17 @@ class LLMRouter:
         )
         self.estimator = TokenEstimator()
 
+        # P13: Response cache + speculative racer + structured validator
+        self._response_cache = ResponseCache(ttl_seconds=3600)
+        self._speculative_racer = SpeculativeRacer(router=self)
+        self._structured_validator = StructuredValidator(router=self)
+
+        # Token tracking: per-provider cumulative token usage for end-of-run summary
+        self._token_usage_by_provider: dict[ProviderType, dict[str, int]] = {
+            pt: {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0}
+            for pt in ProviderType
+        }
+
         # Model lookup: tier → list of (provider_type, model_spec)
         self._tier_models: dict[ModelTier, list[tuple[ProviderType, ModelSpec]]] = {}
         for provider_type, provider_config in provider_configs.items():
@@ -129,6 +165,82 @@ class LLMRouter:
     def get_provider(self, provider_type: ProviderType) -> BaseProvider:
         """Get a provider instance by type."""
         return self._providers[provider_type]
+
+    def get_token_summary(self) -> dict[str, Any]:
+        """Get per-provider token usage breakdown for end-of-run summary.
+
+        Returns a dict with:
+        - total_tokens: sum across all providers
+        - total_input_tokens, total_output_tokens, total_calls
+        - by_provider: {provider_name: {input, output, total, calls}}
+        """
+        by_provider: dict[str, dict[str, int]] = {}
+        grand_total = 0
+        grand_input = 0
+        grand_output = 0
+        grand_calls = 0
+        for pt, stats in self._token_usage_by_provider.items():
+            if stats["total_tokens"] == 0 and stats["calls"] == 0:
+                continue
+            name = pt.value if hasattr(pt, "value") else str(pt)
+            by_provider[name] = {
+                "input_tokens": stats["input_tokens"],
+                "output_tokens": stats["output_tokens"],
+                "total_tokens": stats["total_tokens"],
+                "calls": stats["calls"],
+            }
+            grand_total += stats["total_tokens"]
+            grand_input += stats["input_tokens"]
+            grand_output += stats["output_tokens"]
+            grand_calls += stats["calls"]
+        return {
+            "total_tokens": grand_total,
+            "total_input_tokens": grand_input,
+            "total_output_tokens": grand_output,
+            "total_calls": grand_calls,
+            "by_provider": by_provider,
+        }
+
+    def _predicted_rate_limited(self, provider_type: ProviderType) -> bool:
+        """D9: Check if a provider is predicted to be rate-limited right now.
+
+        Uses the wait gate's sliding window tracker to see if the provider
+        is near its RPM/TPM limit. If so, skip it and try the next provider.
+        """
+        if provider_type not in self._providers:
+            return True
+        provider = self._providers[provider_type]
+        if not provider.health.is_available():
+            return True
+        # Check if any tracker for this provider shows near-limit usage
+        for (pt, _model_name), tracker in self._trackers.items():
+            if pt != provider_type:
+                continue
+            # If RPM or TPM is >85% utilized, predict rate-limited
+            if tracker.model.rpm > 0:
+                rpm_pct = tracker.current_rpm() / tracker.model.rpm
+                if rpm_pct > 0.85:
+                    return True
+            if tracker.model.tpm > 0:
+                tpm_pct = tracker.current_tpm() / tracker.model.tpm
+                if tpm_pct > 0.85:
+                    return True
+        return False
+
+    def _sort_providers_by_priority(
+        self,
+        tier: ModelTier,
+        providers: set[ProviderType],
+    ) -> list[ProviderType]:
+        """D19/D20/D21: Sort providers by tier-specific priority order.
+
+        Providers in _TIER_PROVIDER_PRIORITY come first (in listed order),
+        remaining providers are appended in arbitrary order.
+        """
+        priority = _TIER_PROVIDER_PRIORITY.get(tier, [])
+        ordered = [p for p in priority if p in providers]
+        remaining = [p for p in providers if p not in priority]
+        return ordered + remaining
 
     def get_available_providers(
         self,
@@ -171,6 +283,7 @@ class LLMRouter:
         temperature: float = 0.7,
         max_tokens: int | None = None,
         response_format: dict[str, str] | None = None,
+        _skip_speculative: bool = False,
     ) -> RouterResponse:
         """Execute a completion request at the given tier.
 
@@ -201,6 +314,40 @@ class LLMRouter:
             agent_name=agent_name,
         )
 
+        # P13: Check response cache before hitting any provider
+        cached = self._response_cache.get(
+            tier=tier,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            use_semantic=(urgency != TaskUrgency.HIGH),
+        )
+        if cached is not None:
+            trace("cache", tier=tier.value, agent=agent_name, status="hit")
+            return cached
+
+        # P13: Speculative racing for DEEP tier (critical-path latency reduction)
+        # _skip_speculative prevents infinite recursion when the racer falls back
+        if tier == ModelTier.DEEP and urgency == TaskUrgency.HIGH and not _skip_speculative:
+            response = await self._speculative_racer.race(
+                tier=tier,
+                messages=messages,
+                agent_name=agent_name,
+                urgency=urgency,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+            if response.success:
+                self._response_cache.set(
+                    tier=tier,
+                    messages=messages,
+                    response=response,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            return response
+
         # Try the requested tier first
         response = await self._try_tier(
             tier=tier,
@@ -214,6 +361,7 @@ class LLMRouter:
         )
 
         if response is not None and response.success:
+            self._response_cache.set(tier, messages, response, temperature, max_tokens)
             return response
 
         # If the requested tier failed, try adjacent tiers (§3.3)
@@ -238,6 +386,30 @@ class LLMRouter:
             )
 
             if response is not None and response.success:
+                self._response_cache.set(tier, messages, response, temperature, max_tokens)
+                return response
+
+        # D9: If all adjacent tiers exhausted, try explicit downgrade
+        downgrade_tier = _TIER_DOWNGRADE.get(tier)
+        if downgrade_tier is not None:
+            downgrade_estimated = self.estimator.estimate_tokens(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tier=downgrade_tier,
+                agent_name=agent_name,
+            )
+            response = await self._try_tier(
+                tier=downgrade_tier,
+                messages=messages,
+                estimated_tokens=downgrade_estimated,
+                agent_name=agent_name,
+                urgency=urgency,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+            if response is not None and response.success:
+                self._response_cache.set(tier, messages, response, temperature, max_tokens)
                 return response
 
         # All tiers exhausted — return the last error response
@@ -268,45 +440,60 @@ class LLMRouter:
 
         Handles the wait gate selection, wait-for-capacity, dispatch,
         and failover within the tier. Returns None if no candidates exist.
+
+        D19/D20/D21: Providers are tried in priority order per tier.
         """
         available_providers = self.get_available_providers(tier, urgency)
 
         if not available_providers:
             return None
 
-        # Select the best provider+model via the wait gate
-        candidate, wait_seconds = self.wait_gate.select_with_wait(
+        # D19/D20/D21: Try providers in priority order
+        ordered_providers = self._sort_providers_by_priority(tier, available_providers)
+
+        for provider_type in ordered_providers:
+            # Skip predicted-rate-limited providers
+            if self._predicted_rate_limited(provider_type):
+                continue
+
+            # Select the best model on this provider via the wait gate
+            candidate, wait_seconds = self.wait_gate.select_with_wait(
+                tier=tier,
+                estimated_tokens=estimated_tokens,
+                available_providers={provider_type},
+            )
+
+            if candidate is None:
+                continue
+
+            # If we need to wait, do so
+            if wait_seconds > 0:
+                if wait_seconds > self.settings.wait_gate.medium_wait_threshold:
+                    # > 30s — skip this provider, try next
+                    continue
+                waited = await self.wait_gate.wait_for_capacity(candidate, estimated_tokens)
+                if not waited:
+                    # Capacity didn't open up — try next provider
+                    continue
+
+            # Dispatch the request
+            response = await self._dispatch(
+                candidate=candidate,
+                messages=messages,
+                estimated_tokens=estimated_tokens,
+                agent_name=agent_name,
+                urgency=urgency,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+
+            if response is not None and response.success:
+                return response
+
+        # All providers in this tier exhausted — try remaining without priority filter
+        return await self._try_next_candidate(
             tier=tier,
-            estimated_tokens=estimated_tokens,
-            available_providers=available_providers,
-        )
-
-        if candidate is None:
-            return None
-
-        # If we need to wait, do so
-        if wait_seconds > 0:
-            if wait_seconds > self.settings.wait_gate.medium_wait_threshold:
-                # > 30s — skip this tier, try adjacent
-                return None
-            waited = await self.wait_gate.wait_for_capacity(candidate, estimated_tokens)
-            if not waited:
-                # Capacity didn't open up — try next candidate
-                return await self._try_next_candidate(
-                    tier=tier,
-                    messages=messages,
-                    estimated_tokens=estimated_tokens,
-                    agent_name=agent_name,
-                    urgency=urgency,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    exclude_provider=candidate.provider_type,
-                )
-
-        # Dispatch the request
-        return await self._dispatch(
-            candidate=candidate,
             messages=messages,
             estimated_tokens=estimated_tokens,
             agent_name=agent_name,
@@ -314,6 +501,7 @@ class LLMRouter:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            exclude_provider=None,  # Don't exclude any — we already tried all above
         )
 
     async def _try_next_candidate(
@@ -326,37 +514,56 @@ class LLMRouter:
         temperature: float,
         max_tokens: int | None,
         response_format: dict[str, str] | None,
-        exclude_provider: ProviderType,
+        exclude_provider: ProviderType | None = None,
     ) -> RouterResponse | None:
-        """Try the next candidate in the tier, excluding a failed provider."""
+        """Try ALL remaining candidates in the tier, excluding the failed provider.
+
+        D9 fix: loops through every available provider in the tier, skipping
+        predicted-rate-limited ones, until one succeeds or all are exhausted.
+        D19/D20/D21: providers are sorted by tier priority.
+        """
         available_providers = self.get_available_providers(tier, urgency)
-        available_providers.discard(exclude_provider)
+        if exclude_provider is not None:
+            available_providers.discard(exclude_provider)
 
         if not available_providers:
             return None
 
-        candidate, wait_seconds = self.wait_gate.select_with_wait(
-            tier=tier,
-            estimated_tokens=estimated_tokens,
-            available_providers=available_providers,
-        )
+        # D19/D20/D21: Try providers in priority order
+        ordered_providers = self._sort_providers_by_priority(tier, available_providers)
 
-        if candidate is None:
-            return None
+        for provider_type in ordered_providers:
+            # Skip predicted-rate-limited providers
+            if self._predicted_rate_limited(provider_type):
+                continue
 
-        if wait_seconds > 0 and wait_seconds <= self.settings.wait_gate.medium_wait_threshold:
-            await self.wait_gate.wait_for_capacity(candidate, estimated_tokens)
+            candidate, wait_seconds = self.wait_gate.select_with_wait(
+                tier=tier,
+                estimated_tokens=estimated_tokens,
+                available_providers={provider_type},
+            )
 
-        return await self._dispatch(
-            candidate=candidate,
-            messages=messages,
-            estimated_tokens=estimated_tokens,
-            agent_name=agent_name,
-            urgency=urgency,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            response_format=response_format,
-        )
+            if candidate is None:
+                continue
+
+            if wait_seconds > 0 and wait_seconds <= self.settings.wait_gate.medium_wait_threshold:
+                await self.wait_gate.wait_for_capacity(candidate, estimated_tokens)
+
+            response = await self._dispatch(
+                candidate=candidate,
+                messages=messages,
+                estimated_tokens=estimated_tokens,
+                agent_name=agent_name,
+                urgency=urgency,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+            )
+
+            if response is not None and response.success:
+                return response
+
+        return None
 
     async def _dispatch(
         self,
@@ -417,6 +624,13 @@ class LLMRouter:
                 estimated_tokens=estimated_tokens,
                 actual_tokens=response.total_tokens,
             )
+            # Track per-provider token usage for end-of-run summary
+            stats = self._token_usage_by_provider.get(candidate.provider_type)
+            if stats is not None:
+                stats["input_tokens"] += response.input_tokens
+                stats["output_tokens"] += response.output_tokens
+                stats["total_tokens"] += response.total_tokens
+                stats["calls"] += 1
             return response
 
         # Request failed — attempt failover within the tier

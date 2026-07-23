@@ -22,14 +22,18 @@ dependencies = [
     # Search + extraction
     "duckduckgo-search>=6.0.0",
     "crawl4ai>=0.4.0",
+    "trafilatura>=1.12.0",
+    "curl_cffi>=0.7.0",
     "transformers>=4.44.0",
     "websockets>=12.0",
 
     # Report generation — 300 DPI PDFs, Plotly charts, Pillow image pipeline
     "weasyprint>=62.0",
     "jinja2>=3.1.0",
+    "markupsafe>=2.1.0",
     "plotly>=5.22.0",
-    "kaleido>=0.2.1",
+    "kaleido>=0.2.1,<1.0",  # D26: pin to static engine (v1.x needs Chrome)
+    "matplotlib>=3.8.0",  # D26: chart fallback when kaleido fails
     "pillow>=10.4.0",
 
     # TUI — Textual + Rich + Typer
@@ -51,6 +55,10 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.5.0",
     "mypy>=1.10.0",
+]
+stealth = [
+    "nodriver>=0.36.0",     # P12: undetected Chrome automation
+    "camoufox>=0.4.0",      # P12: stealth Firefox for anti-bot bypass
 ]
 
 [project.scripts]

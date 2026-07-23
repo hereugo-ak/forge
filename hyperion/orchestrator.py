@@ -37,6 +37,7 @@ from typing import Any
 from hyperion.agents.bus import Channel, MessageType, get_bus, reset_bus
 from hyperion.agents.engagement_director import EngagementDirector
 from hyperion.agents.synthesis_lead import SynthesisLead
+from hyperion.obs import ArtifactStore, RunJournal, RunManifest, trace
 from hyperion.schemas.agents import AgentName, AgentState
 from hyperion.schemas.models import (
     FactCheckReport,
@@ -222,12 +223,13 @@ class WorkflowEngine:
             print(f"PDF: {result.pdf_path}")
     """
 
-    MAX_QUALITY_ITERATIONS = 3  # §4.5 Agent 18: max 3 iterations before escalation
-    TASK_TIMEOUT_SECONDS = 300  # 5 minutes — default for most agents
-    SPECIALIST_TIMEOUT_SECONDS = 600  # 10 minutes — specialists spawn up to 3 sub-agents
+    MAX_QUALITY_ITERATIONS = 2  # P7: capped at ≤2 (was 3) — content-aware quality gate
+    TASK_TIMEOUT_SECONDS = 600  # 10 minutes — default for most agents
+    SPECIALIST_TIMEOUT_SECONDS = 1200  # 20 minutes — specialists spawn up to 3 sub-agents
     # Each sub-agent does SearxNG search + Jina read + LLM analysis.
     # With SearxNG semaphore=3 and multiple specialists in parallel,
-    # 300s is not enough — specialists were timing out (MARKET, FINANCE, etc.)
+    # and potentially slow network conditions, 600s was not enough —
+    # specialists were timing out (MARKET, REGULATORY, INNOVATE, etc.)
 
     def __init__(self, bus: Any = None, router: Any = None) -> None:
         self.bus = bus or get_bus()
@@ -238,6 +240,10 @@ class WorkflowEngine:
         self._all_findings: list[Any] = []  # collected from bus
         self._start_time: float = 0.0
         self._engagement_id: str = ""
+        # P10: Durable execution — journal, artifact store, manifest
+        self._journal: RunJournal | None = None
+        self._artifacts: ArtifactStore | None = None
+        self._manifest: RunManifest | None = None
 
     def _log(self, message: str) -> None:
         """Publish a log message to the TUI via Channel.TUI."""
@@ -352,7 +358,32 @@ class WorkflowEngine:
         - Render Engine receives: question, engagement_id, layout_plan
 
         The task is marked RUNNING before execution and COMPLETED/FAILED after.
+
+        P10: Before executing, check the RunJournal for a cached result.
+        If the step already succeeded with the same inputs, load the
+        cached artifact and skip execution entirely.
         """
+        # P10: Check journal for cached result (durable execution replay)
+        inputs_hash = self._compute_step_hash(task, dag)
+        if self._journal:
+            cached = self._journal.get_cached(task.id, inputs_hash)
+            if cached and cached.output_ref and self._artifacts:
+                cached_data = self._artifacts.load(task.id)
+                if cached_data is not None:
+                    trace("journal", step_id=task.id, status="cache_hit",
+                          agent=task.agent.value, run_id=self._engagement_id)
+                    task.status = TaskStatus.COMPLETED
+                    task.completed_at = time.time()
+                    # Reconstruct the output from cached data
+                    cached_obj = self._reconstruct_output(task.agent, cached_data)
+                    if cached_obj is not None:
+                        self._task_outputs[task.id] = cached_obj
+                        self._publish_task_update(task)
+                        # Re-collect findings from cached specialist outputs
+                        if hasattr(cached_obj, "_findings"):
+                            self._all_findings.extend(cached_obj._findings)
+                        return cached_obj
+
         agent = self._get_agent(task.agent)
         task.status = TaskStatus.RUNNING
         task.started_at = time.time()
@@ -377,6 +408,16 @@ class WorkflowEngine:
                 AgentName.CONSUMER_INSIGHTS, AgentName.MA_ANALYST,
                 AgentName.INNOVATION_ANALYST, AgentName.STRATEGY_ANALYST,
             ):
+                # P7 GAP-2: Enrich context with MICRO LLM classifier to
+                # populate industry/geography/sector/etc. from the question
+                # so specialists' search queries are never empty.
+                try:
+                    enriched = await agent._enrich_context(task.description or dag.question)
+                    if enriched:
+                        context.update(enriched)
+                except Exception:
+                    pass
+
                 # Specialists — use extended timeout (they spawn sub-agents)
                 result = await asyncio.wait_for(
                     agent.run(
@@ -402,10 +443,22 @@ class WorkflowEngine:
                 # Synthesis Lead needs the DAG and all findings.
                 # The Synthesis Lead subscribes to Channel.FINDINGS on the bus,
                 # but it's instantiated lazily here — AFTER specialists have
-                # already published their findings. Bus is pub/sub, so missed
-                # messages are gone. Inject the orchestrator's collected
-                # findings directly so synthesis has data to work with.
+                # already published their findings. Bus retention (D4 fix)
+                # replays retained findings on subscription, but we also
+                # inject the orchestrator's collected findings directly
+                # as a belt-and-suspenders guarantee.
                 if hasattr(agent, "_collected_findings"):
+                    # Merge: don't duplicate findings already replayed by bus
+                    existing_ids = {id(f) for f in agent._collected_findings}
+                    for finding in self._all_findings:
+                        if id(finding) not in existing_ids:
+                            agent._collected_findings.append(finding)
+                            agent_name = finding.agent
+                            if agent_name not in agent._findings_by_agent:
+                                agent._findings_by_agent[agent_name] = []
+                            agent._findings_by_agent[agent_name].append(finding)
+                else:
+                    # Fallback: set attributes directly
                     agent._collected_findings = list(self._all_findings)
                     agent._findings_by_agent = {}
                     for finding in self._all_findings:
@@ -413,6 +466,11 @@ class WorkflowEngine:
                         if agent_name not in agent._findings_by_agent:
                             agent._findings_by_agent[agent_name] = []
                         agent._findings_by_agent[agent_name].append(finding)
+
+                self._log(
+                    f"SYNTHESIS: injected {len(self._all_findings)} findings "
+                    f"(total in agent: {len(agent._collected_findings)})"
+                )
 
                 result = await asyncio.wait_for(
                     agent.run(
@@ -511,6 +569,15 @@ class WorkflowEngine:
             self._task_outputs[task.id] = result
             self._publish_task_update(task)
 
+            # P10: Record success in journal + save artifact
+            if self._journal:
+                output_ref = ""
+                if self._artifacts:
+                    output_ref = self._artifacts.save(task.id, result)
+                self._journal.record_success(task.id, inputs_hash, output_ref)
+                trace("journal", step_id=task.id, status="success",
+                      agent=task.agent.value, run_id=self._engagement_id)
+
             # Collect findings for Fact Checker and Synthesis Lead
             if hasattr(agent, "_findings"):
                 findings_count = len(agent._findings)
@@ -540,6 +607,8 @@ class WorkflowEngine:
             task.status = TaskStatus.FAILED
             task.error = f"Task timed out after {timeout_used}s"
             self._publish_task_update(task)
+            if self._journal:
+                self._journal.record_failure(task.id, inputs_hash, f"timeout:{timeout_used}s")
             await self.bus.publish_status(
                 task.agent, AgentState.BLOCKED,
                 detail=f"timed out after {timeout_used}s",
@@ -549,6 +618,8 @@ class WorkflowEngine:
             task.status = TaskStatus.FAILED
             task.error = str(e)
             self._publish_task_update(task)
+            if self._journal:
+                self._journal.record_failure(task.id, inputs_hash, str(e)[:500])
             await self.bus.publish_status(
                 task.agent, AgentState.BLOCKED,
                 detail=str(e)[:200],
@@ -561,6 +632,58 @@ class WorkflowEngine:
             if task.agent == agent_name and task.id in self._task_outputs:
                 return self._task_outputs[task.id]
         return None
+
+    def _compute_step_hash(self, task: TaskNode, dag: WorkflowDAG) -> str:
+        """P10: Compute a deterministic hash of a step's inputs.
+
+        The inputs hash includes the task description, agent, dependencies'
+        outputs, and the engagement question — so any change in inputs
+        invalidates the cache and forces re-execution.
+        """
+        if self._journal is None:
+            return ""
+        inputs: dict[str, Any] = {
+            "agent": task.agent.value,
+            "description": task.description,
+            "question": dag.question,
+        }
+        for dep_id in task.dependencies:
+            if dep_id in self._task_outputs:
+                dep_output = self._task_outputs[dep_id]
+                if hasattr(dep_output, "model_dump"):
+                    inputs[dep_id] = dep_output.model_dump()
+                else:
+                    inputs[dep_id] = str(dep_output)[:500]
+        return self._journal.compute_inputs_hash(inputs)
+
+    def _reconstruct_output(self, agent_name: AgentName, cached_data: Any) -> Any:
+        """P10: Reconstruct a typed output object from cached JSON data.
+
+        Maps each agent to its expected output type so we can rebuild
+        the Pydantic model from the stored JSON artifact.
+        """
+        try:
+            if agent_name == AgentName.SYNTHESIS_LEAD:
+                return FinalReport.model_validate(cached_data)
+            elif agent_name == AgentName.QUALITY_GATE:
+                return QualityScore.model_validate(cached_data)
+            elif agent_name == AgentName.PRESENTATION_DESIGNER:
+                return LayoutPlan.model_validate(cached_data)
+            elif agent_name == AgentName.RENDER_ENGINE:
+                return RenderOutput.model_validate(cached_data)
+            elif agent_name == AgentName.DATA_VISUALIZER:
+                return VisualizationOutput.model_validate(cached_data)
+            elif agent_name == AgentName.FACT_CHECKER:
+                return FactCheckReport.model_validate(cached_data)
+            else:
+                # For specialists and others, return the raw dict —
+                # downstream consumers handle both typed and dict outputs
+                if isinstance(cached_data, dict):
+                    return cached_data
+                return cached_data
+        except Exception:
+            # If reconstruction fails, return raw data — better than crashing
+            return cached_data
 
     async def _execute_wave(self, tasks: list[TaskNode], dag: WorkflowDAG) -> list[Any]:
         """Execute a wave of independent tasks in parallel via asyncio.gather.
@@ -696,6 +819,18 @@ class WorkflowEngine:
         # Get visualization output for visual quality scoring (Dimension 10)
         viz_output = self._get_output_by_agent(dag, AgentName.DATA_VISUALIZER)
 
+        # P7: Content-aware source-count floor — if the report has fewer
+        # sources than this, stop iterating because more passes won't fix
+        # thin evidence; the problem is insufficient data, not insufficient
+        # synthesis.  This prevents wasteful LLM calls on thin reports.
+        source_floor = 3
+        try:
+            from hyperion.config import get_settings
+            _cfg = get_settings()
+            source_floor = getattr(_cfg, "quality_source_floor", 3)
+        except Exception:
+            pass
+
         for iteration in range(1, self.MAX_QUALITY_ITERATIONS + 1):
             iterations = iteration
 
@@ -727,6 +862,17 @@ class WorkflowEngine:
             if current_score.total_score >= 4.0:
                 self._log(f"QUALITY: threshold met at iteration {iteration}")
                 break  # Quality threshold met
+
+            # P7: Content-aware stop — if source count is below floor, stop
+            # iterating.  More synthesis passes won't fix thin evidence.
+            report_sources = getattr(current_report, "total_sources", 0)
+            if report_sources < source_floor:
+                self._log(
+                    f"QUALITY: content-aware stop — only {report_sources} sources "
+                    f"(< floor {source_floor}). More iterations won't fix thin evidence."
+                )
+                current_score.max_iterations_reached = True
+                break
 
             # Score below threshold — iterate with targeted fixes
             if iteration < self.MAX_QUALITY_ITERATIONS:
@@ -774,6 +920,104 @@ class WorkflowEngine:
             critical_dimensions=[],
             max_iterations_reached=True,
         ), iterations
+
+    def _build_floor_report(self, question: str) -> FinalReport | None:
+        """Build a minimal floor-report from collected findings (D13 fix).
+
+        When the Synthesis Lead fails or times out, we still need a
+        FinalReport so the delivery pipeline (Presentation Designer →
+        Data Visualizer → Render Engine) can produce a PDF. This floor
+        report is a best-effort synthesis of whatever findings were
+        collected — not a full reconciliation, but enough to generate
+        a deliverable.
+        """
+        from hyperion.schemas.models import (
+            AnalysisSection,
+            ConfidenceLevel,
+            KeyFinding,
+            Recommendation,
+        )
+
+        findings = self._all_findings
+        if not findings:
+            self._log("FLOOR-REPORT: no findings collected — cannot build floor report")
+            return None
+
+        # Group findings by agent
+        by_agent: dict[str, list[KeyFinding]] = {}
+        for f in findings:
+            agent_name = f.agent if isinstance(f.agent, str) else str(f.agent)
+            if agent_name not in by_agent:
+                by_agent[agent_name] = []
+            by_agent[agent_name].append(f)
+
+        # Build sections from each agent's findings
+        sections: list[AnalysisSection] = []
+        for agent_name, agent_findings in by_agent.items():
+            content_parts = []
+            for f in agent_findings:
+                content_parts.append(
+                    f"**{f.title}** (confidence: {f.confidence.value})\n\n{f.content[:500]}"
+                )
+            sections.append(AnalysisSection(
+                id=f"floor_{agent_name}",
+                title=agent_name.replace("_", " ").title(),
+                agent=agent_name,
+                key_insight=agent_findings[0].title if agent_findings else "No key insight available",
+                body="\n\n---\n\n".join(content_parts) or "No content available",
+                findings=agent_findings,
+                implications="Floor report — implications not synthesized.",
+                confidence=ConfidenceLevel.LOW,
+            ))
+
+        # Build key findings list (top 5 by confidence)
+        confidence_order = {
+            ConfidenceLevel.HIGH: 0,
+            ConfidenceLevel.MEDIUM: 1,
+            ConfidenceLevel.LOW: 2,
+        }
+        key_findings = sorted(
+            findings,
+            key=lambda f: confidence_order.get(f.confidence, 3),
+        )[:5]
+
+        # Build executive summary from findings
+        summary_lines = [
+            f"This report was generated as a floor-report fallback because the "
+            f"Synthesis Lead did not produce a full synthesis. It contains "
+            f"{len(findings)} findings from {len(by_agent)} specialists.",
+            "",
+        ]
+        for f in key_findings:
+            summary_lines.append(f"- {f.title}: {f.content[:150]}")
+
+        return FinalReport(
+            engagement_id=self._engagement_id,
+            question=question,
+            recommendation=Recommendation.INVESTIGATE,
+            recommendation_rationale=(
+                "Insufficient synthesis — the Synthesis Lead did not complete. "
+                "Recommendation defaults to INVESTIGATE pending full analysis. "
+                f"Floor report assembled from {len(findings)} findings."
+            ),
+            critical_assumptions=[
+                "Full synthesis was not completed — findings are not reconciled.",
+                "Contradictions between agents may exist and are not resolved.",
+            ],
+            confidence=ConfidenceLevel.LOW,
+            confidence_breakdown={agent: ConfidenceLevel.LOW for agent in by_agent},
+            executive_summary="\n".join(summary_lines),
+            key_findings=key_findings,
+            sections=sections,
+            agents_used=list(by_agent.keys()),
+            total_sources=sum(1 for f in findings if hasattr(f, "sources") and f.sources),
+            total_data_points=len(findings),
+            limitations=[
+                "Full synthesis was not completed.",
+                "Contradictions are not resolved.",
+                "Quality may be below standard threshold.",
+            ],
+        )
 
     async def _save_to_second_brain(self, result: EngagementResult) -> None:
         """Save engagement context to the Second Brain vault for future learning.
@@ -877,6 +1121,30 @@ class WorkflowEngine:
         self._start_time = time.time()
         self._engagement_id = f"eng_{uuid.uuid4().hex[:12]}"
 
+        # P10: Durable execution — open journal, artifact store, manifest
+        self._journal = RunJournal(self._engagement_id)
+        self._journal.open()
+        self._artifacts = ArtifactStore(self._engagement_id)
+        self._manifest = RunManifest(
+            run_id=self._engagement_id,
+            question=question,
+            conversation_context=conversation_context,
+        )
+        self._manifest.save()
+        trace("durable", run_id=self._engagement_id, status="journal_opened")
+
+        # P9 GAP-4: Startup health table — check every tool + tier
+        try:
+            from hyperion.obs.health import check_startup_health
+            from hyperion.config import get_settings
+            check_startup_health(get_settings())
+        except Exception:
+            pass  # Health check is best-effort — don't block the pipeline
+
+        # Reset SearxNG search budget for this engagement
+        from hyperion.tools.searxng import SearxNGClient
+        SearxNGClient.reset_budget()
+
         # Use the existing bus if it's already running (TUI scenario),
         # otherwise create a fresh one for headless mode
         existing_bus = get_bus()
@@ -886,6 +1154,9 @@ class WorkflowEngine:
             reset_bus()
             self.bus = get_bus()
             await self.bus.start()
+
+        # Clear retained findings from any previous engagement (D4 fix)
+        self.bus.clear_retained_findings()
 
         result = EngagementResult(
             engagement_id=self._engagement_id,
@@ -917,9 +1188,26 @@ class WorkflowEngine:
             fact_check_report = self._get_output_by_agent(dag, AgentName.FACT_CHECKER)
 
             if not final_report:
-                result.error = "Synthesis Lead did not produce a FinalReport"
-                result.duration_seconds = time.time() - self._start_time
-                return result
+                # D13 fix: Build a floor-report fallback from collected findings
+                # so delivery (PDF generation) always runs, even if synthesis failed.
+                self._log(
+                    f"SYNTHESIS: no FinalReport produced — building floor-report fallback "
+                    f"from {len(self._all_findings)} collected findings"
+                )
+                final_report = self._build_floor_report(dag.question)
+                if final_report is None:
+                    result.error = "Synthesis Lead did not produce a FinalReport and floor-report fallback failed"
+                    result.duration_seconds = time.time() - self._start_time
+                    return result
+                # Mark synthesis task as completed with the floor report
+                for task in dag.tasks:
+                    if task.agent == AgentName.SYNTHESIS_LEAD and task.status != TaskStatus.COMPLETED:
+                        task.status = TaskStatus.COMPLETED
+                        task.completed_at = time.time()
+                        task.output = final_report.model_dump()
+                        self._task_outputs[task.id] = final_report
+                        self._publish_task_update(task)
+                        break
 
             result.final_report = final_report
             result.fact_check_report = fact_check_report
@@ -937,6 +1225,19 @@ class WorkflowEngine:
             # Update the task outputs with the iterated report
             self._task_outputs["task_synthesis_lead"] = final_report
             self._task_outputs["task_quality_gate"] = quality_score
+
+            # D4-rest: Explicit FinalReport HANDOFF on the bus so delivery
+            # agents receive it via their subscription, not just via local var.
+            await self.bus.publish(
+                channel=Channel.HANDOFF,
+                msg_type=MessageType.HANDOFF,
+                sender=AgentName.SYNTHESIS_LEAD,
+                payload={
+                    "to_agent": "presentation_designer",
+                    "final_report": final_report.model_dump(),
+                    "quality_score": quality_score.model_dump() if quality_score else None,
+                },
+            )
 
             # ─────────────────────────────────────────────────────────────
             # Stage 5: Delivery — Presentation Designer → Data Viz → Render
@@ -963,7 +1264,23 @@ class WorkflowEngine:
                     )
                     if ready:
                         self._log(f"DELIVERY: executing {task.agent.value}")
-                        await self._execute_task(task, dag)
+                        try:
+                            await self._execute_task(task, dag)
+                        except Exception as e:
+                            # D4-rest: Escalate delivery failure instead of crashing
+                            self._log(f"DELIVERY: {task.agent.value} failed: {e!s:.200}")
+                            await self.bus.publish(
+                                channel=Channel.ESCALATION,
+                                msg_type=MessageType.ESCALATION,
+                                sender=task.agent,
+                                payload={
+                                    "agent": task.agent.value,
+                                    "issue": f"Delivery agent failed: {e!s:.200}",
+                                    "suggested_action": "Proceed with partial output or generate stub PDF",
+                                },
+                            )
+                            task.status = TaskStatus.FAILED
+                            task.error = str(e)[:200]
                     else:
                         self._log(f"DELIVERY: {task.agent.value} dependencies not met — skipping")
 
@@ -1024,10 +1341,36 @@ class WorkflowEngine:
                 f"PDF={'YES' if result.pdf_path else 'NO'}"
             )
 
+            # P13 GAP-6: Completion health table
+            try:
+                from hyperion.obs.health import print_completion_health
+                print_completion_health(result)
+            except Exception:
+                pass
+
+            # P10: Save final manifest metrics
+            if self._manifest:
+                self._manifest.record_final_metrics(
+                    duration_seconds=result.duration_seconds,
+                    quality_score=quality_score.total_score if quality_score else None,
+                    pdf_path=result.pdf_path,
+                    success=result.success,
+                    llm_calls=result.metadata.llm_calls_made if result.metadata else 0,
+                    tokens_consumed=result.metadata.tokens_consumed if result.metadata else 0,
+                )
+                self._manifest.save()
+                trace("durable", run_id=self._engagement_id, status="manifest_saved",
+                      success=result.success, duration=result.duration_seconds)
+
             # ─────────────────────────────────────────────────────────────
             # Save to Second Brain for future learning (§12.8)
             # ─────────────────────────────────────────────────────────────
             await self._save_to_second_brain(result)
+
+            # ─────────────────────────────────────────────────────────────
+            # End-of-run summary
+            # ─────────────────────────────────────────────────────────────
+            self._print_run_summary(result)
 
             return result
 
@@ -1035,7 +1378,93 @@ class WorkflowEngine:
             result.error = str(e)
             result.duration_seconds = time.time() - self._start_time
             self._log(f"ENGAGEMENT FAILED: {type(e).__name__}: {e}")
+            # P10: Record failure in manifest
+            if self._manifest:
+                self._manifest.record_final_metrics(
+                    duration_seconds=result.duration_seconds,
+                    quality_score=None,
+                    pdf_path="",
+                    success=False,
+                )
+                self._manifest.save()
+            # Print summary even on failure
+            self._print_run_summary(result)
             return result
+        finally:
+            # P10: Close journal
+            if self._journal:
+                self._journal.close()
+
+    def _print_run_summary(self, result: EngagementResult) -> None:
+        """Print end-of-run summary with report link, timing, status, and token breakdown."""
+        duration = result.duration_seconds
+        mins = int(duration // 60)
+        secs = int(duration % 60)
+
+        # Build separator
+        sep = "=" * 72
+
+        print(f"\n{sep}")
+        print("  HYPERION ENGAGEMENT SUMMARY")
+        print(sep)
+
+        # Status
+        status_str = "SUCCESS" if result.success else "FAILED"
+        print(f"  Status:          {status_str}")
+        if result.error and not result.success:
+            print(f"  Error:           {result.error[:200]}")
+
+        # Report links
+        print(f"  PDF Report:      {result.pdf_path or 'N/A'}")
+        print(f"  Markdown Report: {result.markdown_path or 'N/A'}")
+
+        # Timing
+        print(f"  Duration:        {mins}m {secs}s ({duration:.1f}s)")
+
+        # Quality
+        if result.quality_score:
+            print(f"  Quality Score:   {result.quality_score.total_score:.1f}/5.0")
+            print(f"  Quality Iters:   {result.quality_iterations}")
+        else:
+            print(f"  Quality Score:   N/A")
+
+        # Agents & findings
+        if result.dag:
+            agents = ", ".join(a.value for a in result.dag.agents_selected)
+            print(f"  Agents Used:     {agents}")
+        print(f"  Adaptations:     {result.adaptation_count}")
+        print(f"  Escalations:     {result.escalation_count}")
+
+        # Token breakdown by provider
+        token_summary: dict[str, Any] = {}
+        if self.router and hasattr(self.router, "get_token_summary"):
+            try:
+                token_summary = self.router.get_token_summary()
+            except Exception:
+                pass
+
+        total_tokens = token_summary.get("total_tokens", 0)
+        total_calls = token_summary.get("total_calls", 0)
+        print(f"\n  Total Tokens:    {total_tokens:,}")
+        print(f"  Total LLM Calls: {total_calls:,}")
+
+        by_provider = token_summary.get("by_provider", {})
+        if by_provider:
+            print(f"\n  Token Breakdown by Provider:")
+            print(f"  {'Provider':<16} {'Input':>10} {'Output':>10} {'Total':>12} {'Calls':>8}")
+            print(f"  {'-' * 16} {'-' * 10} {'-' * 10} {'-' * 12} {'-' * 8}")
+            for provider_name in sorted(by_provider.keys()):
+                stats = by_provider[provider_name]
+                print(
+                    f"  {provider_name:<16} "
+                    f"{stats['input_tokens']:>10,} "
+                    f"{stats['output_tokens']:>10,} "
+                    f"{stats['total_tokens']:>12,} "
+                    f"{stats['calls']:>8,}"
+                )
+
+        print(sep)
+        print()
 
     async def close(self) -> None:
         """Clean up resources — close all agents and their tool clients."""

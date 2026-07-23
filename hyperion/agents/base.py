@@ -145,17 +145,93 @@ class BaseAgent(ABC):
         return self.spec.system_prompt
 
     # ─────────────────────────────────────────────────────────────────────
-    # Context Enrichment — extract entities from question string
+    # Context Enrichment — MICRO LLM classifier (P7 GAP-2)
+    # Replaces brittle regex keyword matching with a fast LLM classification
+    # call that returns structured intent: industry, geography, sector,
+    # technology, company, etc.  Falls back to regex if the LLM call fails.
     # ─────────────────────────────────────────────────────────────────────
 
-    def _enrich_context(self, question: str) -> dict[str, Any]:
+    _ENRICH_CLASSIFIER_PROMPT = (
+        "You are a fast entity classifier. Extract structured intent from the "
+        "user's business research question. Return ONLY a JSON object with these "
+        "keys (omit any that don't apply):\n"
+        "  \"geography\": country/region mentioned (e.g. \"US\", \"EU\", \"India\")\n"
+        "  \"jurisdiction\": primary regulatory jurisdiction\n"
+        "  \"industry\": the industry or sector (e.g. \"fintech\", \"healthcare\")\n"
+        "  \"sector\": same as industry if applicable\n"
+        "  \"space\": the market space or domain\n"
+        "  \"technology\": specific technology if mentioned (e.g. \"kubernetes\", \"AI\")\n"
+        "  \"company\": named company if mentioned\n"
+        "  \"segment\": market segment if mentioned\n"
+        "  \"business_model\": business model if mentioned\n"
+        "  \"stakeholder_audience\": primary audience if mentioned\n"
+        "  \"acquirer\": acquiring company if M&A question\n"
+        "  \"size_range\": deal/company size range if mentioned\n"
+        "  \"tickers\": list of stock tickers if mentioned\n"
+        "  \"value_drivers\": list of key value drivers if mentioned\n"
+        "  \"vendors\": list of vendor names if mentioned\n"
+        "  \"process_type\": operational process type if mentioned\n"
+        "  \"architecture_description\": architecture if described\n"
+        "  \"use_case\": specific use case if mentioned\n\n"
+        "Question: {question}\n\n"
+        "Return JSON:"
+    )
+
+    async def _enrich_context(self, question: str) -> dict[str, Any]:
         """Extract industry, geography, sector, etc. from the question string.
+
+        P7 GAP-2: Uses a MICRO tier LLM call to classify the question into
+        structured intent fields. Falls back to regex keyword matching if
+        the LLM call fails or the router is unavailable.
 
         Specialists expect context keys like 'industry', 'geography', 'space',
         'technology', 'company' — but the orchestrator only passes prior agent
-        outputs keyed by agent name. This method parses the question to populate
-        those keys so search queries are never empty.
+        outputs keyed by agent name. This method populates those keys so
+        search queries are never empty.
         """
+        # Try MICRO LLM classifier first
+        try:
+            ctx = await self._enrich_context_llm(question)
+            if ctx:
+                return ctx
+        except Exception:
+            pass
+
+        # Fallback: regex keyword matching (original implementation)
+        return self._enrich_context_regex(question)
+
+    async def _enrich_context_llm(self, question: str) -> dict[str, Any]:
+        """MICRO LLM classifier for context enrichment (P7 GAP-2)."""
+        import json
+
+        prompt = self._ENRICH_CLASSIFIER_PROMPT.format(question=question[:500])
+        response = await self._llm_complete(
+            user_prompt=prompt,
+            urgency=TaskUrgency.LOW,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+
+        if not response.success or not response.content:
+            return {}
+
+        data = json.loads(response.content)
+        # Normalize: ensure geography-derived fields are consistent
+        geo = data.get("geography")
+        if geo and "jurisdiction" not in data:
+            data["jurisdiction"] = geo
+        if geo and "jurisdictions" not in data:
+            data["jurisdictions"] = [geo]
+        # Ensure sector/space/industry consistency
+        industry = data.get("industry")
+        if industry:
+            data.setdefault("sector", industry)
+            data.setdefault("space", industry)
+        return data
+
+    @staticmethod
+    def _enrich_context_regex(question: str) -> dict[str, Any]:
+        """Regex fallback for context enrichment (original implementation)."""
         import re
 
         ctx: dict[str, Any] = {}
@@ -256,7 +332,9 @@ class BaseAgent(ABC):
         elif self.role == AgentRole.SUPPORT:
             channels = {Channel.FINDINGS}
         elif self.role == AgentRole.DELIVERY:
-            channels = {Channel.FINDINGS}
+            # D4-rest: Delivery needs HANDOFF (receives FinalReport from Synthesis)
+            # and FINDINGS (receives viz output, layout plan from other delivery agents)
+            channels = {Channel.FINDINGS, Channel.HANDOFF}
         else:
             channels = {Channel.FINDINGS}
 
@@ -451,6 +529,17 @@ class BaseAgent(ABC):
                 suggested_action="Reroute to adjacent tier or retry with different provider",
             )
 
+        # Strip markdown code fences from JSON responses — many LLMs wrap
+        # JSON in ```json blocks despite response_format=json_object.
+        # This fixes all downstream json.loads(response.content) calls.
+        if response.success and response.content and response_format and response_format.get("type") == "json_object":
+            content = response.content.strip()
+            if content.startswith("```"):
+                from hyperion.router.structured_validator import extract_json
+                cleaned = extract_json(content)
+                if cleaned:
+                    response.content = cleaned
+
         return response
 
     async def _llm_complete_structured(
@@ -487,9 +576,13 @@ class BaseAgent(ABC):
             return None
 
         try:
-            data = json.loads(response.content)
+            from hyperion.router.structured_validator import extract_json
+            json_str = extract_json(response.content)
+            if json_str is None:
+                raise json.JSONDecodeError("No JSON found in response", response.content, 0)
+            data = json.loads(json_str)
             return output_model.model_validate(data)
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
             await self._escalate(
                 issue=f"Structured output parsing failed: {e}",
                 suggested_action="Retry with explicit JSON instruction in prompt",
@@ -517,6 +610,22 @@ class BaseAgent(ABC):
             self._tools[tool] = self._instantiate_tool(tool)
 
         return self._tools[tool]
+
+    async def get_tool_or_escalate(self, tool: ToolName) -> Any | None:
+        """D4-rest: Get a tool, escalating on failure instead of raising.
+
+        If the tool is unavailable (not in spec, or instantiation fails),
+        publishes an ESCALATION so the director can adapt. Returns None
+        on failure — callers must check and degrade gracefully.
+        """
+        try:
+            return self.get_tool(tool)
+        except (ValueError, RuntimeError, ImportError) as e:
+            await self._escalate(
+                issue=f"Tool {tool.value} unavailable: {e!s:.200}",
+                suggested_action="Degrade gracefully or reroute to alternative tool",
+            )
+            return None
 
     def _instantiate_tool(self, tool: ToolName) -> Any:
         """Instantiate a tool by name.

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -79,6 +80,8 @@ from hyperion.schemas.models import (
     SourceCredibility,
 )
 from hyperion.schemas.workflow import WorkflowDAG
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,7 +232,7 @@ class SynthesisLead(BaseAgent):
         # Quality gate score (received from Quality Gate)
         self._quality_score: QualityScore | None = None
         self._quality_iteration: int = 0
-        self._max_quality_iterations: int = 3
+        self._max_quality_iterations: int = 2  # P7: capped at ≤2 (was 3)
 
         # The current FinalReport (iteratively refined)
         self._current_report: FinalReport | None = None
@@ -264,6 +267,90 @@ class SynthesisLead(BaseAgent):
                 if agent_name not in self._findings_by_agent:
                     self._findings_by_agent[agent_name] = []
                 self._findings_by_agent[agent_name].append(finding)
+            else:
+                # Specialists publish full analysis objects via bus.publish
+                # without a "finding" key — extract summary data as a synthetic
+                # KeyFinding so the synthesis lead has access to quantitative
+                # results (TAM, DCF, WACC, etc.) for narrative generation.
+                payload = msg.payload
+                agent_name = msg.sender.value
+
+                # Map analysis payload keys to readable content
+                analysis_keys = [
+                    "market_analysis", "financial_analysis", "risk_analysis",
+                    "technology_assessment", "operations_analysis",
+                    "regulatory_analysis", "sustainability_analysis",
+                    "consumer_insights", "ma_analysis", "innovation_analysis",
+                    "strategy_analysis", "competitive_landscape",
+                ]
+                for key in analysis_keys:
+                    if key in payload:
+                        try:
+                            summary = json.dumps(payload[key], default=str)[:3000]
+                        except (TypeError, ValueError):
+                            summary = str(payload[key])[:3000]
+
+                        # Extract headline metrics from common fields
+                        headlines = []
+                        headline_title = ""
+                        analysis_data = payload.get(key, {})
+                        if isinstance(analysis_data, dict):
+                            # Try to build a meaningful title from key metrics
+                            for title_key, label in [
+                                ("tam_triangulated", "TAM"),
+                                ("dcf_valuation", "DCF Valuation"),
+                                ("comp_valuation", "Comp Valuation"),
+                                ("market_maturity", "Market Maturity"),
+                                ("residual_risk_summary", "Residual Risk"),
+                                ("build_vs_buy", "Build vs Buy"),
+                            ]:
+                                val = analysis_data.get(title_key)
+                                if val is not None:
+                                    val_str = str(val)
+                                    if len(val_str) > 120:
+                                        val_str = val_str[:117] + "..."
+                                    headlines.append(f"{label}: {val_str}")
+                                    if not headline_title:
+                                        headline_title = f"{label}: {val_str}"
+
+                            # Extract key value drivers as headlines
+                            kvd = analysis_data.get("key_value_drivers", [])
+                            if isinstance(kvd, list):
+                                for vd in kvd[:3]:
+                                    headlines.append(f"Key Value Driver — {vd}")
+                                    if not headline_title:
+                                        headline_title = f"Key Value Driver — {vd}"
+
+                        if not headline_title:
+                            # Fallback: use confidence or risk count
+                            for fb_key in ("confidence", "risk_count", "competitor_count", "white_space_count"):
+                                fb_val = payload.get(fb_key)
+                                if fb_val is not None:
+                                    headline_title = f"{fb_key.replace('_', ' ').title()}: {fb_val}"
+                                    break
+
+                        if not headline_title:
+                            headline_title = f"{agent_name.replace('_', ' ').title()} Analysis"
+
+                        content = summary
+                        if headlines:
+                            content = "\n".join(headlines) + "\n\n" + summary
+
+                        synthetic = KeyFinding(
+                            id=f"summary_{agent_name}_{uuid.uuid4().hex[:8]}",
+                            agent=agent_name,
+                            finding_type="analysis_summary",
+                            title=headline_title[:200],
+                            content=content,
+                            sources=[],
+                            confidence=ConfidenceLevel.MEDIUM,
+                            implications=headlines[0] if headlines else "",
+                        )
+                        self._collected_findings.append(synthetic)
+                        if agent_name not in self._findings_by_agent:
+                            self._findings_by_agent[agent_name] = []
+                        self._findings_by_agent[agent_name].append(synthetic)
+                        break
 
         elif msg.channel == Channel.HANDOFF:
             payload = msg.payload
@@ -874,14 +961,58 @@ class SynthesisLead(BaseAgent):
         - Clear implications for the recommendation
         """
 
+        # Consulting-style section titles — never use raw agent names as headings
+        AGENT_SECTION_TITLES = {
+            "market_analyst": "Market Landscape",
+            "competitive_intel": "Competitive Landscape",
+            "financial_analyst": "Financial Viability",
+            "risk_analyst": "Risk Assessment",
+            "technology_analyst": "Technology Architecture",
+            "operations_analyst": "Operational Feasibility",
+            "regulatory_analyst": "Regulatory Environment",
+            "sustainability_analyst": "Sustainability Assessment",
+            "consumer_insights": "Consumer Insights",
+            "ma_analyst": "M&A Assessment",
+            "innovation_analyst": "Innovation Outlook",
+            "strategy_analyst": "Strategic Options",
+        }
+
+        def _section_title(agent: str) -> str:
+            return AGENT_SECTION_TITLES.get(agent, agent.replace("_", " ").title())
+
         async def _build_one_section(
             agent: str,
             findings: list[KeyFinding],
         ) -> AnalysisSection:
             if not findings:
-                return None  # type: ignore[return-value]
+                return AnalysisSection(
+                    id=f"section_{agent}",
+                    title=_section_title(agent),
+                    agent=agent,
+                    key_insight="No findings available for this section",
+                    body=(
+                        f"The {_section_title(agent)} analysis did not produce "
+                        f"specific findings for this engagement. This is a data-"
+                        f"availability gap, not an absence of analytical relevance."
+                    ),
+                    findings=[],
+                    charts=[],
+                    images=[],
+                    implications="No specific implications could be derived — data gap.",
+                    sources=[],
+                    confidence=ConfidenceLevel.LOW,
+                )
 
-            key_finding = max(findings, key=lambda f: len(f.sources))
+            # Select the best finding for the key insight box.
+            # Prefer findings with real implications and non-generic titles.
+            # Avoid "analysis_summary" type findings whose titles may be raw data labels.
+            def _insight_score(f: KeyFinding) -> tuple:
+                has_implications = bool(f.implications and f.implications.strip())
+                is_specific = f.finding_type != "analysis_summary"
+                has_sources = len(f.sources) > 0
+                return (has_implications and is_specific, has_implications, has_sources, len(f.sources))
+
+            key_finding = max(findings, key=_insight_score)
             all_sources: list[Source] = []
             for f in findings:
                 all_sources.extend(f.sources)
@@ -897,11 +1028,11 @@ class SynthesisLead(BaseAgent):
             narrative_prompt = (
                 "You are a senior consultant at a top-tier strategy firm (McKinsey/BCG).\n"
                 "Write a deep, analytical narrative section for a client report.\n\n"
-                f"Section topic: {agent.replace('_', ' ').title()}\n"
+                f"Section topic: {_section_title(agent)}\n"
                 f"Engagement question: {self._question}\n\n"
                 f"Findings from the {agent} analyst:\n{findings_digest}\n\n"
                 f"Sources:\n{sources_digest}\n\n"
-                "Write a comprehensive section body (1500-3000 words) that:\n"
+                "Write a comprehensive section body (2000-4000 words) that:\n"
                 "1. Opens with context — why this dimension matters for the question\n"
                 "2. Presents key data points with specific numbers and sources cited inline\n"
                 "3. Interprets the data — what does it mean? What's the 'so what'?\n"
@@ -909,9 +1040,13 @@ class SynthesisLead(BaseAgent):
                 "5. Draws out implications for the overall recommendation\n"
                 "6. Uses clear structure with sub-headings (marked with **bold**)\n"
                 "7. Writes in professional consulting prose — authoritative, precise, no fluff\n"
-                "8. Cites sources naturally (e.g., 'According to [Source]...')\n\n"
+                "8. Cites sources naturally (e.g., 'According to [Source]...')\n"
+                "9. Includes at least 4-6 substantial paragraphs of 150+ words each\n"
+                "10. Synthesizes across findings — don't just summarize each finding\n"
+                "11. Ends with a clear 'so what' paragraph that connects to the engagement\n\n"
                 "Do NOT write bullet points. Write flowing analytical paragraphs.\n"
                 "Do NOT repeat the section title. Start directly with the narrative.\n"
+                "Do NOT write fewer than 2000 words. Depth is critical.\n"
             )
 
             section_body = "\n\n".join(f.content for f in findings)  # fallback
@@ -919,17 +1054,44 @@ class SynthesisLead(BaseAgent):
             try:
                 response = await self._llm_complete(
                     user_prompt=narrative_prompt,
-                    urgency=TaskUrgency.HIGH,
+                    urgency=TaskUrgency.NORMAL,
                     temperature=0.3,
+                    system_prompt_override=(
+                        "You are a senior consultant writing a report section. "
+                        "Write analytical prose, not bullet points. "
+                        "Each section must be at least 2000 words of deep analysis."
+                    ),
                 )
-                if response.success and response.content and len(response.content) > 500:
+                if response.success and response.content and len(response.content) > 800:
                     section_body = response.content
+                elif response.success and response.content:
+                    # Response too short — retry with stronger instruction
+                    retry_prompt = (
+                        f"The previous attempt was only {len(response.content)} characters — "
+                        f"far too short for a consulting report section.\n\n"
+                        f"{narrative_prompt}\n\n"
+                        f"Previous attempt (DO NOT REPEAT — write something better):\n"
+                        f"{response.content[:500]}\n\n"
+                        "Write the FULL section now. It must be at least 2000 words. "
+                        "Do not stop early. Do not summarize. Write complete paragraphs."
+                    )
+                    retry_response = await self._llm_complete(
+                        user_prompt=retry_prompt,
+                        urgency=TaskUrgency.NORMAL,
+                        temperature=0.4,
+                        system_prompt_override=(
+                            "You are a senior consultant. Your previous attempt was too short. "
+                            "Write a thorough, deep analytical section of at least 2000 words."
+                        ),
+                    )
+                    if retry_response.success and retry_response.content and len(retry_response.content) > 800:
+                        section_body = retry_response.content
             except (ValueError, AttributeError, RuntimeError):
                 pass  # Use fallback concatenation
 
             return AnalysisSection(
                 id=f"section_{agent}",
-                title=agent.replace("_", " ").title(),
+                title=_section_title(agent),
                 agent=agent,
                 key_insight=key_finding.title,
                 body=section_body,
@@ -942,10 +1104,10 @@ class SynthesisLead(BaseAgent):
             )
 
         # Build all sections in parallel — each section's LLM call is independent
+        # D5: include agents with no findings so sections are never missing
         tasks = [
             _build_one_section(agent, findings)
             for agent, findings in self._findings_by_agent.items()
-            if findings
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -953,6 +1115,8 @@ class SynthesisLead(BaseAgent):
         for result in results:
             if isinstance(result, AnalysisSection):
                 sections.append(result)
+            elif isinstance(result, Exception):
+                logger.warning("Section build failed: %s", result)
 
         return sections
 
@@ -1140,6 +1304,120 @@ class SynthesisLead(BaseAgent):
             return ""
 
     # ─────────────────────────────────────────────────────────────────────
+    # D5: Combined critical-path + recommendation (single DEEP call)
+    # ─────────────────────────────────────────────────────────────────────
+
+    async def _identify_and_draft(
+        self,
+        matrix: dict[str, Any],
+        contradictions: list[Contradiction],
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Identify critical path AND draft recommendation in a single DEEP call.
+
+        D5 fix: collapses former steps 5+6 into one LLM call to keep
+        total DEEP calls ≤ 3 (combined + sections + quality-iteration).
+        """
+        findings_summary = self._format_findings_for_llm()
+
+        contradictions_summary = "\n".join(
+            f"- {c.agent_a} vs {c.agent_b}: {c.finding_a} vs {c.finding_b} "
+            f"→ Resolved: {c.resolution or 'unresolved'}"
+            for c in contradictions
+        ) if contradictions else "No contradictions found."
+
+        prompt = (
+            "You are the Synthesis Lead. Do TWO things in one response:\n\n"
+            f"Question: {self._question}\n\n"
+            f"All findings:\n{findings_summary}\n\n"
+            f"Contradictions:\n{contradictions_summary}\n\n"
+            "FIRST: Identify the 2-3 CRITICAL findings — the ones that, if they "
+            "changed, would flip the recommendation.\n\n"
+            "SECOND: Draft the recommendation as JSON with these fields:\n"
+            "{\n"
+            '  "critical_findings": ["finding_title_1", ...],\n'
+            '  "reasoning": "why these are critical",\n'
+            '  "recommendation": "enter|no_go|conditional|investigate|acquire|do_not_acquire|hold",\n'
+            '  "recommendation_rationale": "The evidence chain — specific, not generic",\n'
+            '  "critical_assumptions": ["assumption1", "assumption2"],\n'
+            '  "executive_summary": "Standalone summary for the CEO — recommendation + key findings + critical risks",\n'
+            '  "key_findings_titles": ["3-5 finding titles that support the recommendation"]\n'
+            "}\n\n"
+            "Rules:\n"
+            "- The recommendation must follow from the findings, not from generic reasoning\n"
+            "- Critical assumptions are assumptions that would FLIP the recommendation if wrong\n"
+            "- The executive summary must stand alone — a CEO reads only that page\n"
+            "- Be confident. No hedging. If uncertain, use CONDITIONAL with specific conditions\n"
+        )
+
+        response = await self._llm_complete(
+            user_prompt=prompt,
+            urgency=TaskUrgency.HIGH,
+            temperature=0.4,
+            response_format={"type": "json_object"},
+        )
+
+        fallback_critical: list[str] = []
+        all_findings = self._get_all_findings()
+        fallback_critical = [f.title for f in all_findings[:3]]
+
+        fallback_rec: dict[str, Any] = {
+            "recommendation": "investigate",
+            "recommendation_rationale": "Insufficient data for a definitive recommendation.",
+            "critical_assumptions": [],
+            "executive_summary": "Further research is needed before a recommendation can be made.",
+            "key_findings_titles": [],
+        }
+
+        if not response.success or not response.content:
+            return fallback_critical, fallback_rec
+
+        try:
+            data = json.loads(response.content)
+            critical = data.get("critical_findings", [])
+            if not isinstance(critical, list) or not critical:
+                critical = fallback_critical
+            else:
+                critical = [str(c) for c in critical[:3]]
+
+            rec = {
+                "recommendation": data.get("recommendation", "investigate"),
+                "recommendation_rationale": data.get("recommendation_rationale", ""),
+                "critical_assumptions": data.get("critical_assumptions", []),
+                "executive_summary": data.get("executive_summary", ""),
+                "key_findings_titles": data.get("key_findings_titles", []),
+            }
+            return critical, rec
+        except (json.JSONDecodeError, ValueError, TypeError) as e:
+            logger.warning("Combined identify+draft JSON parse failed: %s", e)
+            return fallback_critical, fallback_rec
+
+    def _minimal_report(self, reason: str = "") -> FinalReport:
+        """D5: Always return a valid FinalReport, even on total failure."""
+        return FinalReport(
+            engagement_id=self._engagement_id or f"eng_{uuid.uuid4().hex[:12]}",
+            question=self._question or "",
+            recommendation=Recommendation.INVESTIGATE,
+            recommendation_rationale=(
+                f"Synthesis was unable to complete normally: {reason}. "
+                f"This is a degraded report — further research is required."
+            ),
+            critical_assumptions=["Further research is needed to validate any assumptions"],
+            confidence=ConfidenceLevel.LOW,
+            confidence_breakdown={},
+            executive_summary=(
+                f"This is a degraded report. Synthesis could not complete fully: {reason}. "
+                f"The recommendation is INVESTIGATE pending additional research."
+            ),
+            key_findings=self._get_all_findings()[:5],
+            sections=[],
+            contradictions=[],
+            agents_used=self._get_participating_agents(),
+            total_sources=len({s.url for f in self._get_all_findings() for s in f.sources}),
+            total_data_points=len(self._get_all_findings()),
+            limitations=[f"Synthesis incomplete: {reason}"],
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
     # Main execution — the 8-step methodology
     # ─────────────────────────────────────────────────────────────────────
 
@@ -1171,6 +1449,26 @@ class SynthesisLead(BaseAgent):
         self._engagement_id = engagement_id or f"eng_{uuid.uuid4().hex[:12]}"
         self._question = question
         self._dag = dag
+
+        try:
+            return await self._run_synthesis(engagement_id, question, dag)
+        except Exception as e:
+            logger.error("Synthesis run() failed: %s — returning degraded report", e, exc_info=True)
+            await self._escalate(
+                issue=f"Synthesis failed: {e!s:.200}",
+                suggested_action="Use degraded report; check logs for root cause",
+            )
+            degraded = self._minimal_report(reason=str(e)[:200])
+            self._current_report = degraded
+            return degraded
+
+    async def _run_synthesis(
+        self,
+        engagement_id: str,
+        question: str,
+        dag: WorkflowDAG | None,
+    ) -> FinalReport:
+        """Internal synthesis logic — called by run() with try/except guard."""
 
         # Subscribe to bus channels — CORE role, but specifically needs
         # FINDINGS (to collect specialist output) and HANDOFF (for fact
@@ -1222,13 +1520,11 @@ class SynthesisLead(BaseAgent):
         )
         resolved_contradictions = await self._resolve_contradictions(contradictions, matrix)
 
-        # Step 5: Identify critical path
-        await self._transition(AgentState.WORKING, "Identifying critical path to recommendation")
-        critical_path = await self._identify_critical_path(matrix, resolved_contradictions)
-
-        # Step 6: Draft recommendation
-        await self._transition(AgentState.WORKING, "Drafting recommendation with evidence chain")
-        recommendation_data = await self._draft_recommendation(critical_path, resolved_contradictions)
+        # Step 5+6: Identify critical path AND draft recommendation (single DEEP call)
+        await self._transition(AgentState.WORKING, "Identifying critical path + drafting recommendation")
+        critical_path, recommendation_data = await self._identify_and_draft(
+            matrix, resolved_contradictions,
+        )
 
         # Step 7: Calibrate confidence
         await self._transition(AgentState.WORKING, "Calibrating system confidence")

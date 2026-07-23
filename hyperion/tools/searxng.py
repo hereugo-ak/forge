@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ from urllib.parse import quote_plus
 import httpx
 
 from hyperion.tools.jina import JinaClient
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -130,13 +133,19 @@ class SearxNGClient:
 
     CACHE_DIR = "output/.searxng_cache"
     CACHE_TTL_SECONDS = 3600  # 1 hour
-    REQUEST_TIMEOUT = 30  # seconds
+    REQUEST_TIMEOUT = 45  # seconds — must match SearxNG max_request_timeout
     MAX_RETRIES = 3
     RETRY_DELAY = 2  # seconds
-    MAX_CONCURRENT = 5  # limit parallel requests to avoid upstream rate-limits/CAPTCHAs
+    MAX_CONCURRENT = 10  # allow more parallel searches across 12 specialists
+
+    # Search budget cap — 200 discovery searches per engagement
+    # 12 specialists × ~10-15 searches each + 3 sub-agents × ~3 searches each = 150-200
+    SEARCH_BUDGET_CAP = 200
 
     # Class-level semaphore shared across all instances
     _semaphore: asyncio.Semaphore | None = None
+    _search_count: int = 0
+    _budget_exceeded: bool = False
 
     def __init__(self, settings: Any | None = None) -> None:
         self.settings = settings
@@ -195,6 +204,153 @@ class SearxNGClient:
                 seen[result.url] = result
         return list(seen.values())
 
+    @classmethod
+    def reset_budget(cls) -> None:
+        """Reset the search budget counter — called at the start of each engagement."""
+        cls._search_count = 0
+        cls._budget_exceeded = False
+
+    @classmethod
+    def get_search_count(cls) -> int:
+        """Return the current search count for this engagement."""
+        return cls._search_count
+
+    async def _search_searxng_json(
+        self,
+        query: str,
+        num_results: int,
+        categories: str,
+        language: str,
+        time_range: str,
+        engines: str,
+        safesearch: int,
+    ) -> SearchResponse | None:
+        """Query the SearXNG JSON API directly.
+
+        SearXNG aggregates 70+ search engines in a single request.
+        No API key, no rate limit, no browser, no CAPTCHA.
+        Returns None if the request fails or SearXNG is unavailable.
+        """
+        client = await self._get_client()
+
+        params: dict[str, Any] = {
+            "q": query,
+            "format": "json",
+            "categories": categories,
+            "language": language,
+            "safesearch": safesearch,
+        }
+        if time_range:
+            params["time_range"] = time_range
+        if engines:
+            params["engines"] = engines
+
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                response = await client.get("/search", params=params)
+                response.raise_for_status()
+
+                data = response.json()
+                raw_results = data.get("results", [])
+
+                results: list[SearchResult] = []
+                engines_used_set: set[str] = set()
+
+                for item in raw_results:
+                    url = item.get("url", "")
+                    if not url:
+                        continue
+                    engine_name = item.get("engine", "unknown")
+                    engines_used_set.add(engine_name)
+                    results.append(SearchResult(
+                        title=item.get("title", ""),
+                        url=url,
+                        snippet=item.get("content", ""),
+                        engine=engine_name,
+                        score=float(item.get("score", 1.0)),
+                        category=item.get("category", categories),
+                        published_date=item.get("publishedDate", ""),
+                    ))
+
+                if results:
+                    results = self._deduplicate(results)[:num_results]
+                    return SearchResponse(
+                        query=query,
+                        results=results,
+                        total=len(results),
+                        took_ms=int(data.get("number_of_results", 0)),
+                        engines_used=sorted(engines_used_set),
+                    )
+
+                # Log unresponsive engines for debugging
+                unresponsive = data.get("unresponsive_engines", [])
+                if unresponsive:
+                    logger.warning(
+                        "SearXNG unresponsive engines for '%s': %s",
+                        query[:80], unresponsive,
+                    )
+
+                # SearXNG returned zero results — don't retry, engines are likely blocked
+                logger.debug("SearXNG returned 0 results for '%s' (attempt %d)", query, attempt + 1)
+                break  # No point retrying if engines are blocked/CAPTCHA'd
+
+            except (httpx.HTTPError, httpx.RequestError, KeyError, ValueError) as e:
+                logger.warning("SearXNG JSON API error (attempt %d): %s", attempt + 1, e)
+                if attempt < self.MAX_RETRIES - 1:
+                    await asyncio.sleep(self.RETRY_DELAY * (attempt + 1))
+                continue
+
+        return None
+
+    async def _search_jina_fallback(
+        self,
+        query: str,
+        num_results: int,
+        categories: str,
+    ) -> SearchResponse | None:
+        """Fallback: search via Jina (s.jina.ai).
+
+        Jina is keyless and reliable but returns fewer results.
+        Only used when SearXNG is unavailable or returns nothing.
+        """
+        if not self.settings:
+            return None
+
+        try:
+            jina = JinaClient(settings=self.settings)
+            jina_resp = await jina.search(query=query, num_results=num_results)
+            await jina.close()
+
+            if jina_resp.results:
+                results: list[SearchResult] = []
+                for jr in jina_resp.results:
+                    results.append(SearchResult(
+                        title=jr.title,
+                        url=jr.url,
+                        snippet=jr.snippet,
+                        engine="jina",
+                        score=1.0,
+                        category=categories,
+                    ))
+
+                if results:
+                    results = self._deduplicate(results)[:num_results]
+                    return SearchResponse(
+                        query=query,
+                        results=results,
+                        total=len(results),
+                        took_ms=jina_resp.took_ms,
+                        engines_used=["jina"],
+                    )
+        except (httpx.HTTPError, httpx.RequestError, RuntimeError, OSError) as e:
+            logger.warning("Jina fallback search failed: %s", e)
+
+        return None
+
+    # Only use engines that are reliable (no CAPTCHA/403 issues)
+    # Must match searxng_settings.yml engine list
+    RELIABLE_ENGINES = "bing,wikipedia,arxiv,github,hackernews"
+
     async def search(
         self,
         query: str,
@@ -203,25 +359,26 @@ class SearxNGClient:
         language: str = "en",
         time_range: str = "",
         engines: str = "",
-        safesearch: int = 1,
+        safesearch: int = 0,
         max_results: int | None = None,
     ) -> SearchResponse:
-        """Search via the unified stealth search system.
+        """Search via SearXNG JSON API — the primary discovery engine.
 
-        Primary: FlareSolverr (Docker headless Chromium — solves CAPTCHAs, searches DuckDuckGo)
-        Fallback: Playwright stealth Bing (non-headless Chromium with anti-detection)
+        SearXNG aggregates 70+ search engines in a single request.
+        No API key, no rate limit, no browser, no CAPTCHA.
+        If SearXNG is unavailable or returns no results, falls back to Jina.
 
-        SearxNG container and Jina are NOT used — they were unreliable.
-        This method always returns results if the internet is up.
+        Search budget cap: 60 discovery searches per engagement (§5.2).
+        Cached results do not count against the budget.
 
         Args:
             query: Search query string
             num_results: Maximum number of results to return
-            categories: Search categories (ignored — always general web search)
-            language: Language code (ignored — FlareSolverr handles this)
-            time_range: Time filter (ignored)
-            engines: Comma-separated list of engines (ignored)
-            safesearch: Safe search level (ignored)
+            categories: Search category (general, images, news, it, science)
+            language: Language code (en, fr, de, etc.)
+            time_range: Time filter (day, week, month, year, or empty)
+            engines: Comma-separated list of specific engines to use
+            safesearch: Safe search level (0=off, 1=moderate, 2=strict)
 
         Returns:
             SearchResponse with deduplicated, scored results.
@@ -229,118 +386,60 @@ class SearxNGClient:
         if max_results is not None:
             num_results = max_results
 
+        # Use reliable engines by default to avoid CAPTCHA/403 from flaky defaults
+        effective_engines = engines if engines else self.RELIABLE_ENGINES
+
         cache_key = self._cache_key(query, num_results=num_results, categories=categories,
-                                     language=language, time_range=time_range, engines=engines)
+                                     language=language, time_range=time_range, engines=effective_engines)
         cached = self._get_cached(cache_key)
         if cached:
             return cached
 
-        # ── PRIMARY: FlareSolverr (headless Chromium, solves CAPTCHAs) ──
-        try:
-            from hyperion.tools.flaresolverr import FlareSolverrClient
+        # Enforce search budget cap (cached results don't count)
+        if SearxNGClient._search_count >= SearxNGClient.SEARCH_BUDGET_CAP:
+            if not SearxNGClient._budget_exceeded:
+                logger.warning("Search budget cap reached (%d searches) — returning cached/empty",
+                               SearxNGClient.SEARCH_BUDGET_CAP)
+                SearxNGClient._budget_exceeded = True
+            return SearchResponse(query=query, results=[], total=0, engines_used=[])
 
-            flare = FlareSolverrClient()
-            flare_results_raw = await flare.search(query, num_results=num_results)
-            await flare.close()
+        SearxNGClient._search_count += 1
 
-            if flare_results_raw:
-                results: list[SearchResult] = []
-                for fr in flare_results_raw:
-                    results.append(SearchResult(
-                        title=fr.get("title", ""),
-                        url=fr.get("url", ""),
-                        snippet=fr.get("snippet", ""),
-                        engine=fr.get("engine", "flaresolverr"),
-                        score=1.0,
-                        category=categories,
-                    ))
+        assert SearxNGClient._semaphore is not None
+        async with SearxNGClient._semaphore:
+            # ── PRIMARY: SearXNG JSON API ──
+            searxng_response = await self._search_searxng_json(
+                query=query,
+                num_results=num_results,
+                categories=categories,
+                language=language,
+                time_range=time_range,
+                engines=effective_engines,
+                safesearch=safesearch,
+            )
 
-                if results:
-                    results = self._deduplicate(results)[:num_results]
-                    search_response = SearchResponse(
-                        query=query,
-                        results=results,
-                        total=len(results),
-                        took_ms=0,
-                        engines_used=["flaresolverr"],
-                    )
-                    self._set_cached(cache_key, search_response)
-                    return search_response
-        except Exception as e:
-            logger.warning("FlareSolverr search failed: %s", e)
+            if searxng_response and searxng_response.results:
+                self._set_cached(cache_key, searxng_response)
+                return searxng_response
 
-        # ── FALLBACK: Playwright stealth Bing (non-headless Chromium) ──
-        try:
-            from hyperion.tools.stealth_search import StealthSearchClient
+            # ── FALLBACK: Jina Search (s.jina.ai) ──
+            logger.info("SearXNG returned no results for '%s' — falling back to Jina", query)
+            jina_response = await self._search_jina_fallback(
+                query=query,
+                num_results=num_results,
+                categories=categories,
+            )
 
-            stealth = StealthSearchClient()
-            stealth_results_raw = await stealth.search(query, num_results=num_results)
-            await stealth.close()
+            if jina_response and jina_response.results:
+                self._set_cached(cache_key, jina_response)
+                return jina_response
 
-            if stealth_results_raw:
-                results = []
-                for sr in stealth_results_raw:
-                    results.append(SearchResult(
-                        title=sr.title,
-                        url=sr.url,
-                        snippet=sr.snippet,
-                        engine=sr.engine,
-                        score=1.0,
-                        category=categories,
-                    ))
-
-                if results:
-                    results = self._deduplicate(results)[:num_results]
-                    search_response = SearchResponse(
-                        query=query,
-                        results=results,
-                        total=len(results),
-                        took_ms=0,
-                        engines_used=["stealth_bing"],
-                    )
-                    self._set_cached(cache_key, search_response)
-                    return search_response
-        except Exception as e:
-            logger.warning("Stealth Bing search failed: %s", e)
-
-        # ── LAST RESORT: Jina API (no CAPTCHA, always works, fewer results) ──
-        if self.settings:
-            try:
-                jina = JinaClient(settings=self.settings)
-                jina_resp = await jina.search(query=query, num_results=num_results)
-                await jina.close()
-
-                if jina_resp.results:
-                    results = []
-                    for jr in jina_resp.results:
-                        results.append(SearchResult(
-                            title=jr.title,
-                            url=jr.url,
-                            snippet=jr.snippet,
-                            engine="jina",
-                            score=1.0,
-                            category=categories,
-                        ))
-
-                    if results:
-                        results = self._deduplicate(results)[:num_results]
-                        search_response = SearchResponse(
-                            query=query,
-                            results=results,
-                            total=len(results),
-                            took_ms=0,
-                            engines_used=["jina"],
-                        )
-                        self._set_cached(cache_key, search_response)
-                        return search_response
-            except Exception as e:
-                logger.warning("Jina search failed: %s", e)
-
+        # All search paths exhausted
+        logger.warning("All search paths exhausted for query: '%s'", query)
         return SearchResponse(
             query=query,
             results=[],
             total=0,
-            took_ms=0,
             engines_used=[],
         )
 
